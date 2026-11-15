@@ -1,6 +1,6 @@
 // 列島フロント オフライン用 Service Worker
 // 新しい版を配るときは VERSION を書き換える（例: v2.17-1 → v2.18-1）
-const VERSION = 'v2.18-6';
+const VERSION = 'v2.18-8';
 const CACHE = 'retto-front-' + VERSION;
 const FILES = ['./', './index.html', './manifest.json', './icon-180.png'];
 

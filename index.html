@@ -37,7 +37,7 @@ button small{opacity:.75;font-size:11px}
 #speed button{min-height:32px;padding:2px 8px;font-size:13px}
 #map{position:absolute;inset:0}
 canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
-#board{position:absolute;right:8px;top:calc(84px + env(safe-area-inset-top));z-index:4;background:#0f1522e6;border:1px solid var(--line);border-radius:10px;padding:6px 8px;font-size:12px;min-width:170px;max-height:46vh;overflow:auto}
+#board{position:absolute;right:8px;top:calc(var(--topH, calc(78px + env(safe-area-inset-top))) + 6px);z-index:4;background:#0f1522e6;border:1px solid var(--line);border-radius:10px;padding:6px 8px;font-size:12px;min-width:170px;max-height:46vh;overflow:auto}
 #board .r{display:flex;justify-content:space-between;gap:8px;padding:1px 0}
 #board .dot,.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:0}
 #board.min .rows{display:none}
@@ -58,11 +58,11 @@ canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
 #mini{position:absolute;inset:auto;left:auto;top:auto;right:8px;bottom:calc(8px + env(safe-area-inset-bottom));z-index:5;border:1px solid var(--line);border-radius:8px;background:#0a1422;cursor:crosshair;box-shadow:0 2px 10px #0008}
 @media (max-width: 820px){#mini{display:none}}
 #sel{max-width:560px}   /* 選択カードの外側（透明な帯）が地図のドラッグを邪魔しないように */
-#news{position:absolute;left:8px;top:calc(84px + env(safe-area-inset-top));z-index:6;display:flex;flex-direction:column;gap:4px;width:min(380px,calc(100vw - 170px));pointer-events:none}
+#news{position:absolute;left:8px;top:calc(var(--topH, calc(78px + env(safe-area-inset-top))) + 6px);z-index:6;display:flex;flex-direction:column;gap:4px;width:min(380px,calc(100vw - 170px));pointer-events:none}
 #news .nw{background:#121927ee;border:1px solid var(--line);border-left:4px solid #e6a35a;border-radius:8px;padding:5px 8px;font-size:12.5px;line-height:1.45;transition:opacity .6s}
 #news .nw.bad{border-left-color:#ff5a5a} #news .nw.good{border-left-color:#5adf8a} #news .nw.warn{border-left-color:#ffd166}
 .dot{width:11px!important;height:11px!important;box-shadow:0 0 0 1px #0008}
-#toast{position:absolute;left:50%;top:calc(86px + env(safe-area-inset-top));transform:translateX(-50%);background:#0f1522ee;border:1px solid var(--line);border-radius:10px;padding:6px 12px;z-index:6;display:none;font-size:13px;max-width:92vw;text-align:center}
+#toast{position:absolute;left:50%;top:calc(var(--topH, calc(78px + env(safe-area-inset-top))) + 8px);transform:translateX(-50%);background:#0f1522ee;border:1px solid var(--line);border-radius:10px;padding:6px 12px;z-index:6;display:none;font-size:13px;max-width:92vw;text-align:center}
 #overlay{position:fixed;inset:0;background:#000b;display:none;align-items:center;justify-content:center;z-index:10;padding:10px;padding-top:calc(10px + env(safe-area-inset-top));padding-bottom:calc(10px + env(safe-area-inset-bottom));padding-left:calc(10px + env(safe-area-inset-left));padding-right:calc(10px + env(safe-area-inset-right))}
 #overlay .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;max-width:760px;width:100%;max-height:100%;box-sizing:border-box;overflow:auto;line-height:1.6}
 #overlay h2{margin:0 0 8px;font-size:19px}
@@ -87,7 +87,7 @@ canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
   #speed{display:flex;gap:4px;flex:none}
   #speed button,#bMenu{min-height:34px;padding:2px 9px}
   .tbar{width:54px}
-  #board{top:auto;bottom:auto;top:calc(84px + env(safe-area-inset-top));right:6px;font-size:11.5px;min-width:0}
+  #board{top:auto;bottom:auto;top:calc(var(--topH, calc(78px + env(safe-area-inset-top))) + 6px);right:6px;font-size:11.5px;min-width:0}
   #board.min{padding:4px 8px}
   .btns button{min-width:0;flex:1 1 40%}
   button{min-height:40px}
@@ -1172,7 +1172,7 @@ function stepFukai(st, dt) {
     clusters.push({ comp, S, F, rep: r.id });
     if (S > maxS) maxS = S;
   }
-  st.fukaiMax = maxS;
+  st.fukaiMax = maxS; st.fukaiC = clusters.length;   // fukaiC：腐海のかたまりの数（勢力表の表示用）
   // 進軍：兵力が満タンで、戦力が難易度ごとの水準に達した腐海は、まわりの土地へ進軍する（予告のあと、兵力のmf割で攻める）。荒廃度0の土地も飲める
   const live0 = q => q.owner !== FUKAI && q.owner !== -2;
   // 巨大な腐海（兵力が難易度ごとの水準以上）は、腐海に囲まれた土地と、ほかの腐海と合体できるルートを優先して進軍する
@@ -2294,12 +2294,17 @@ function renderTop() {
     setHTML($('#stats'), `<span><span class="dot" style="${dotStyle(f)}"></span><b>${esc(f.short)}</b></span>
       <span title="兵力／上限（メーターの青は手元の兵、橙は攻撃に出ている兵）">⚔ <b>${kfmt(f.troops)}</b><small>/${kfmt(mx)}</small><span class="tbar"><i style="width:${Math.min(100, f.troops / mx * 100)}%"></i><b style="width:${Math.max(0, Math.min(100 - Math.min(100, f.troops / mx * 100), ia / mx * 100))}%"></b></span><small> +${kfmt(gr)}/秒</small></span>
       <span title="金">💰 <b>${kfmt(f.gold)}</b><small> +${kfmt(Fr.goldRate(st, f.id))}/秒</small></span>
-      <span>🗾 ${Fr.regionsOf(st, f.id).length}</span>${vpBar(f.id)}<span>${mmss(st.t)}</span>${Fr.leaderOf(st) === f.id ? '<span class="bad" title="国力が一位なので、各国があなたを優先して狙い、条約も結んでくれません">👑 一位：各国に狙われています</span>' : ''}`);
+      <span>🗾 ${Fr.regionsOf(st, f.id).length}</span>${vpBar(f.id)}<span>${mmss(st.t)}</span>${Fr.leaderOf(st) === f.id ? `<span class="bad" title="国力が一位なので、各国があなたを優先して狙い、条約も結んでくれません">👑 一位${isNarrow() ? '' : '：各国に狙われています'}</span>` : ''}`);
   }
+  syncTopH();
   const startHint = paused && st && !st.over && (st.t < 0.05 || st.extPending);
   setHTML($('#speed'), isNarrow() ? `<button data-sp="p" class="${paused ? 'on' : ''}${startHint ? ' pulse' : ''}">${paused ? (startHint ? '▶ 開始' : '▶') : '⏸'}</button><button data-sp="c">×${speed}</button>`
     : `<button data-sp="p" class="${paused ? 'on' : ''}${startHint ? ' pulse' : ''}">${paused ? (startHint ? '▶ 開始' : '▶') : '⏸'}</button>${SPEEDS.map(v => `<button data-sp="${v}" class="${speed === v ? 'on' : ''}">×${v}</button>`).join('')}`);
 }
+// 上のバーの高さ（一位の表示などで段が増えると高くなる）に合わせて、勢力表・ニュース・通知を下にずらす
+let topH = 0;
+function syncTopH() { const h = $('#top').offsetHeight; if (h && h !== topH) { topH = h; document.documentElement.style.setProperty('--topH', h + 'px'); } }
+window.addEventListener('resize', () => { topH = 0; if (st) renderTop(); });
 $('#speed').onclick = e => {
   const b = e.target.closest('[data-sp]'); if (!b) return; const v = b.dataset.sp;
   if (v === 'p') { paused = !paused; if (!paused) st.extPending = false; }
@@ -2317,7 +2322,7 @@ function renderBoard() {
   const top = rows.slice(0, isNarrow() ? 6 : 10);
   const mine = rows.findIndex(r => r.f.id === st.player);
   $('#board').className = boardMin ? 'min' : '';
-  setHTML($('#board'), `<div class="r" id="bdT" style="cursor:pointer"><b>勢力（${rows.length}）</b><span class="dim">${boardMin ? '▾' : '▴'}</span></div><div class="rows">${top.map((r, i) => `<div class="r" ${r.f.id === st.player ? 'style="color:#ffe08a"' : ''}><span><span class="dot" style="${dotStyle(r.f)}"></span>${i + 1}. ${esc(r.f.short)}${r.f.id === Fr.leaderOf(st) ? ' 👑' : ''}${!st.spectator && Fr.pactOf(st, st.player, r.f.id) ? ' 🤝' : ''}</span><span title="兵力の上限（最大国力）・地域数">⚔${kfmt(r.mx)}・${r.n}</span></div>`).join('')}${mine >= top.length ? `<div class="r" style="color:#ffe08a"><span>${mine + 1}. ${esc(me().short)}</span><span>${rows[mine].n}・${kfmt(me().troops)}</span></div>` : ''}${st.fukaiN ? `<div class="r" style="color:#c77dff" title="順位・勝利条件には数えない"><span>🍄 腐海</span><span>⚔${kfmt(Fr.fkTroops(st.fukaiMax || 0, st))}・${st.fukaiN}</span></div>` : ''}</div>`);
+  setHTML($('#board'), `<div class="r" id="bdT" style="cursor:pointer"><b>勢力（${rows.length}）</b><span class="dim">${boardMin ? '▾' : '▴'}</span></div><div class="rows">${top.map((r, i) => `<div class="r" ${r.f.id === st.player ? 'style="color:#ffe08a"' : ''}><span><span class="dot" style="${dotStyle(r.f)}"></span>${i + 1}. ${esc(r.f.short)}${r.f.id === Fr.leaderOf(st) ? ' 👑' : ''}${!st.spectator && Fr.pactOf(st, st.player, r.f.id) ? ' 🤝' : ''}</span><span title="兵力の上限（最大国力）・地域数">⚔${kfmt(r.mx)}・${r.n}</span></div>`).join('')}${mine >= top.length ? `<div class="r" style="color:#ffe08a"><span>${mine + 1}. ${esc(me().short)}</span><span>${rows[mine].n}・${kfmt(me().troops)}</span></div>` : ''}${st.fukaiN ? `<div class="r" style="color:#c77dff" title="順位・勝利条件には数えない。兵力はいちばん大きいかたまりのもの（かたまりどうしは兵力を共有しない）"><span>🍄 腐海${st.fukaiC > 1 ? `（${st.fukaiC}群）` : ''}</span><span title="いちばん大きいかたまりの兵力・腐海の地域数の合計">最大⚔${kfmt(Fr.fkTroops(st.fukaiMax || 0, st))}・計${st.fukaiN}</span></div>` : ''}</div>`);
 }
 $('#board').onclick = e => { if (e.target.closest('#bdT')) { boardMin = !boardMin; renderBoard(); } };
 function renderRatio() {
@@ -2511,7 +2516,11 @@ document.querySelectorAll('#menu [data-m]').forEach(b => b.onclick = () => {
 
 /* ---- 画面の切り替え ---- */
 // 自動投資：重視するもの（金額・最大兵力・均等）と残す金を選んで、一括で建てる
-const autoSet = (() => { try { return Object.assign({ mode: 'even', reserve: 0, fukai: false, sam: true }, JSON.parse(localStorage.getItem('front_auto') || '{}')); } catch (e) { return { mode: 'even', reserve: 0, fukai: false, sam: true }; } })();
+// 自動投資の設定はゲームごと（新しいゲーム・続きの読み込みで初期値に戻る）。防空基地は高いので初期は「建てない」
+const AUTO_DEF = { mode: 'even', reserve: 0, fukai: false, sam: false, keep: false };
+const autoSet = Object.assign({}, AUTO_DEF);
+const resetAuto = () => Object.assign(autoSet, AUTO_DEF);
+try { localStorage.removeItem('front_auto'); } catch (e) {}
 function showAuto() {
   if (!st || st.spectator || st.over) { toast('自動投資は自分で戦っているときだけ使えます'); return; }
   const f = me(), modes = [['gold', '💰 金額（毎秒の収入）'], ['troops', '⚔ 最大兵力'], ['even', '⚖ 均等']], res = [0, 50000, 100000, 500000, 1000000, 5000000];
@@ -2521,13 +2530,13 @@ function showAuto() {
     <h4>残す金</h4><div class="chips">${res.map(v => `<button data-ar="${v}" class="${autoSet.reserve === v ? 'on' : ''}">${v ? '💰' + kfmt(v) : '残さない'}</button>`).join('')}</div>
     ${st.fukai ? `<h4>腐海対策</h4><div class="chips"><button data-af="0" class="${!autoSet.fukai ? 'on' : ''}">ふつうに建てる</button><button data-af="1" class="${autoSet.fukai ? 'on' : ''}">🍄 未建築の荒廃地を優先</button></div>
     <div class="small dim">オンにすると、建物のない荒廃地（腐海の発生源になる）を荒廃度の高い所から先に建てます。建物があれば、そこから腐海が生まれることはありません（隣から飲み込まれる侵食は止まりません）。</div>` : ''}
-    <h4>防空基地</h4><div class="chips"><button data-as="1" class="${autoSet.sam !== false ? 'on' : ''}">📡 建てる</button><button data-as="0" class="${autoSet.sam === false ? 'on' : ''}">建てない</button></div>
+    <h4>防空基地</h4><div class="chips"><button data-as="1" class="${autoSet.sam === true ? 'on' : ''}">📡 建てる</button><button data-as="0" class="${autoSet.sam === false ? 'on' : ''}">建てない</button></div>
     <div class="small dim">重要な地域（収入・兵力の大きい地域、首都、ミサイル基地）をなるべく多く守備範囲に入れられる位置に建てます。ひととおり覆えたら、特に重要な地域から二重目の防空網を重ねます（1基は撃つと装填に20秒かかるので、重ねると続けざまのミサイルに強くなります）。ほかの建物と効き目を比べて、割に合うときだけ建てます。</div>
     <h4>続けるか</h4><div class="chips"><button data-ak="0" class="${!autoSet.keep ? 'on' : ''}">今回だけ</button><button data-ak="1" class="${autoSet.keep ? 'on' : ''}">🔁 建設が終わるたびに続ける</button></div>
     <div class="small dim">1つの地域では同時に1件しか建てられないので、一括でも「建設中でない地域の数」までになります。続ける設定なら、建て終わるたびに残りを自動で建てます。</div>
     <div class="small" style="margin-top:6px">金額で指定：<input id="arIn" type="number" min="0" step="1000" value="${autoSet.reserve}" style="width:110px;font:inherit;background:#0f1522;color:inherit;border:1px solid #26324a;border-radius:6px;padding:4px"></div>`,
     [{ label: '一括で建てる', primary: true, fn: runAuto }, { label: 'やめる' }]);
-  const saveSet = () => { try { localStorage.setItem('front_auto', JSON.stringify(autoSet)); } catch (e) {} };
+  const saveSet = () => {};
   box.querySelectorAll('[data-am]').forEach(b => b.onclick = () => { autoSet.mode = b.dataset.am; saveSet(); showAuto(); });
   box.querySelectorAll('[data-ar]').forEach(b => b.onclick = () => { autoSet.reserve = +b.dataset.ar; saveSet(); showAuto(); });
   box.querySelectorAll('[data-af]').forEach(b => b.onclick = () => { autoSet.fukai = b.dataset.af === '1'; saveSet(); showAuto(); });
@@ -2536,7 +2545,7 @@ function showAuto() {
   box.querySelector('#arIn').onchange = e => { autoSet.reserve = Math.max(0, Math.round(+e.target.value || 0)); saveSet(); };
 }
 function runAuto() {
-  const f = me(), g0 = f.gold, done = Fr.autoInvest(st, f.id, autoSet.mode, autoSet.reserve, autoSet.fukai, autoSet.sam !== false);
+  const f = me(), g0 = f.gold, done = Fr.autoInvest(st, f.id, autoSet.mode, autoSet.reserve, autoSet.fukai, autoSet.sam === true);
   if (!done.length) { toast(`建てられる所がありません（残す金💰${kfmt(autoSet.reserve)}を下回るか、上限に達しています）`); return; }
   const cnt = {}; done.forEach(([, k]) => { cnt[k] = (cnt[k] || 0) + 1; });
   toast(`🏗 ${Object.entries(cnt).map(([k, n]) => Fr.BUILD[k].icon + Fr.BUILD[k].name + '×' + n).join('・')}を建設開始（💰${kfmt(g0 - f.gold)}使用・残り💰${kfmt(f.gold)}）`);
@@ -2544,7 +2553,7 @@ function runAuto() {
 }
 function autoTick() {   // 続ける設定のとき、約1秒ごとに空いた地域へ建てる
   if (!autoSet.keep || !st || st.spectator || st.over || paused) return;
-  if (Fr.autoInvest(st, me().id, autoSet.mode, autoSet.reserve, autoSet.fukai, autoSet.sam !== false).length) { selKey = ''; }
+  if (Fr.autoInvest(st, me().id, autoSet.mode, autoSet.reserve, autoSet.fukai, autoSet.sam === true).length) { selKey = ''; }
 }
 function overlay(html, buttons) {
   const el = $('#overlay'); paused = true;
@@ -2612,6 +2621,7 @@ ${rest()}`,
   box.querySelectorAll('[data-fk]').forEach(b => b.onclick = () => { setup.playerKey = b.dataset.fk; showSetup(); });
 }
 function startNew() {
+  resetAuto();
   if (st && !st.over && !st.spectator) awardPoints();   // 途中でやめても最大版図の分は入る
   for (const k in setup.perks) setup.perks[k] = Math.min(setup.perks[k], perkMaxOf(k));
   st = Fr.newGame(J, setup); miniG = null; sel = null; paused = true; speed = 1; overShown = false;
