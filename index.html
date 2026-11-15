@@ -1792,6 +1792,10 @@ const META_KEY = 'retto_front_meta';
 const OLD_ITEM_COST = { troops: 80, gold: 80, capital: 120, harbor: 100, fort: 150, drill: 200, trade: 200 };
 let meta = (() => { try { const m = JSON.parse(localStorage.getItem(META_KEY) || 'null'); if (m) { const r = { points: m.points || 0, perks: m.perks || {}, history: m.history || [], trophies: m.trophies || {}, trophiesExt: m.trophiesExt || {}, extStars: m.extStars || {} }; if (Array.isArray(m.unlocked) && m.unlocked.length) r.points += m.unlocked.reduce((a, k) => a + (OLD_ITEM_COST[k] || 0), 0); return r; } } catch (e) {} return { points: 0, perks: {}, history: [], trophies: {}, trophiesExt: {}, extStars: {} }; })();
 const perkMaxOf = k => meta.perks[k] || 0;
+// 引き継ぎ要素の「選んだレベル」は端末に保存して、日本列島⇔全世界の切り替え（読み込み直し）やアプリの再起動でも保つ
+const PERKSEL_KEY = 'front_perksel';
+try { const ps = JSON.parse(localStorage.getItem(PERKSEL_KEY) || 'null'); if (ps && typeof ps === 'object') for (const k in ps) if (Fr.PERKS[k]) setup.perks[k] = Math.max(0, Math.min(+ps[k] || 0, perkMaxOf(k))); } catch (e) {}
+const savePerkSel = () => { try { localStorage.setItem(PERKSEL_KEY, JSON.stringify(setup.perks)); } catch (e) {} };
 // トロフィー：勝った勢力ごとに、いちばん難しい難しさを記録（🥉やさしい・🥈ふつう・🥇むずかしい・🏆超難、延長戦も勝てば⭐）
 const DIFF_ORDER = ['easy', 'normal', 'hard', 'veryhard'], TROPHY = ['🥉', '🥈', '🥇', '🏆'];
 const scOn = o => !!o.scenario && (J.world ? o.scenario === 'continents' && ((J.maps.find(m => m[0] === (o.map || 'world')) || [0, 0, []])[2].length >= 2) : (o.map || 'all') === 'all');   // シナリオが効いているか
@@ -2603,8 +2607,8 @@ function showSetup() {
 ${rest()}`,
     [{ label: '始める', primary: true, fn: startNew }].concat(st && !st.over ? [{ label: '続ける' }] : [], [{ label: '🔁 引き継ぎコード', fn: () => showCode(showSetup) }]));
   box.scrollTop = keepScroll;
-  box.querySelectorAll('[data-pl]').forEach(b => b.onclick = () => { const [k, d] = b.dataset.pl.split(':'); setup.perks[k] = Math.max(0, Math.min(perkMaxOf(k), (Math.min(setup.perks[k] || 0, perkMaxOf(k))) + +d)); showSetup(); });
-  box.querySelectorAll('[data-pu]').forEach(b => b.onclick = () => { const k = b.dataset.pu, nx = perkMaxOf(k) + 1; if (meta.points < Fr.perkCost(nx)) return; meta.points -= Fr.perkCost(nx); meta.perks[k] = nx; setup.perks[k] = nx; saveMeta(); showSetup(); });
+  box.querySelectorAll('[data-pl]').forEach(b => b.onclick = () => { const [k, d] = b.dataset.pl.split(':'); setup.perks[k] = Math.max(0, Math.min(perkMaxOf(k), (Math.min(setup.perks[k] || 0, perkMaxOf(k))) + +d)); savePerkSel(); showSetup(); });
+  box.querySelectorAll('[data-pu]').forEach(b => b.onclick = () => { const k = b.dataset.pu, nx = perkMaxOf(k) + 1; if (meta.points < Fr.perkCost(nx)) return; meta.points -= Fr.perkCost(nx); meta.perks[k] = nx; setup.perks[k] = nx; saveMeta(); savePerkSel(); showSetup(); });
   box.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => {
     if (b.dataset.mode === window.FRONT_MODE) return;
     if (st && !st.over) save();
