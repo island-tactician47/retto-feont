@@ -487,7 +487,8 @@ function applyPerks(st, f, perks) {
   fa.goldMul = 1 + L('gold') * 0.0125; fa.growMul = 1 + L('grow') * 0.0125; fa.capMul = 1 + L('cap') * 0.0125;   // v1.8：1段階あたり半分
   fa.buildGrow = 2 - 0.8 * AS(L('build')); fa.buildTime = 4 - 2.5 * AS(L('speed'));
   fa.atkMul = 1 - 0.5 * AS(L('atk')); fa.defMul = 1 + AS(L('def'));
-  fa.misMul = 1 - AS(L('mis')) / 3;   // v1.8：割引は最大1/3（値段の2/3まで） fa.samBoost = AS(L('sam'));
+  fa.misMul = 1 - AS(L('mis')) / 3;   // v1.8：割引は最大1/3（値段の2/3まで）
+  fa.samBoost = AS(L('sam'));   // v2.18：前の行のコメントに入っていて効いていなかったのを修正
   fa.gold += L('fund') * 125;
   fa.troops = maxTroops(st, f) * (0.5 + 0.5 * AS(L('start')));
 }
@@ -758,8 +759,19 @@ function hitRegion(r, heavy) {
   r.build = null;
 }
 // 戦略核：目標と、陸続きの隣の地域（海峡・航路の先は除く。持ち主を問わない。自分の領土・焼け野原も含む）に1発ずつ弾頭。
-// 迎撃は、各地域の持ち主の防空基地（守備範囲内・装填済みのいちばん近い1基）が受け持ち、弾頭ごとに判定する
+// 迎撃は、各地域の持ち主の防空基地（守備範囲内・装填済み）が近い順に、残った弾頭を撃つ（v2.18）
 const nukePoints = (st, rid) => { const M = map(st.J); return [rid].concat(M.land[rid].filter(a => st.regions[a].owner !== -2)); };   // 陸続きだけ（海峡・航路の先は含まない）
+// 防空基地：持ち主 o の、目標（複数なら最も近いもの）から SAM_R 以内で装填済みの基地を近い順に（v2.18：外れたら次の基地が撃つ）
+function samsInRange(st, o, targets) {
+  const out = [];
+  for (const r of st.regions) {
+    if (r.owner !== o || !r.sam || r.samCd > st.t) continue;
+    const d = Math.min(...targets.map(x => pdist(st, r.id, x)));
+    if (d <= SAM_R) out.push({ r, d });
+  }
+  return out.sort((a, b) => a.d - b.d).map(x => x.r);
+}
+const samRate = (st, o, M_) => M_.intercept + (0.95 - M_.intercept) * (st.factions[o].samBoost || 0);
 function hitStrategic(st, m) {
   const F = st.factions, M_ = MISSILE.strategic;
   const pts = nukePoints(st, m.to);
@@ -768,14 +780,19 @@ function hitStrategic(st, m) {
   for (const ok in byOwner) {
     const o = +ok, list = byOwner[ok];
     if (o < 0) { landed.push(...list); continue; }
-    let sam = null, sd = Infinity;
-    for (const r of st.regions) { if (r.owner !== o || !r.sam || r.samCd > st.t) continue; const d = Math.min(...list.map(x => pdist(st, r.id, x))); if (d <= SAM_R && d < sd) { sd = d; sam = r; } }
-    if (!sam) { landed.push(...list); continue; }
-    sam.samCd = st.t + SAM_CD;
-    const rate = M_.intercept + (0.95 - M_.intercept) * (F[o].samBoost || 0);
-    const got = list.filter(() => rnd() >= rate); landed.push(...got);
+    // 近い基地から順に、残った弾頭を迎撃する（撃ち漏らしがあれば次の基地へ。全弾落とすか、装填済みの基地がなくなるまで）
+    const sams = samsInRange(st, o, list);
+    if (!sams.length) { landed.push(...list); continue; }
+    const rate = samRate(st, o, M_);
+    let got = list, sam = sams[0], nUsed = 0;
+    for (const b of sams) {
+      if (!got.length) break;
+      b.samCd = st.t + SAM_CD; nUsed++;
+      got = got.filter(() => rnd() >= rate);
+    }
+    landed.push(...got);
     if (got.length < list.length) { news(st, `🛡 迎撃成功！${F[m.owner].short}の戦略核の弾頭${list.length}発のうち${list.length - got.length}発を撃ち落とした${got.length ? `（残り${got.length}発が着弾）` : '（全弾迎撃）'}`, [o], 'good'); news(st, `✖ 戦略核の弾頭${list.length}発のうち${list.length - got.length}発を${F[o].short}に迎撃された`, [m.owner], 'bad'); }
-    if (got.length < list.length) addLog(st, `📡 ${F[o].short}の防空基地（${st.J.provs[sam.id].name}）が${F[m.owner].short}の${M_.name}の弾頭${list.length}発のうち${list.length - got.length}発を迎撃した`, o);
+    if (got.length < list.length) addLog(st, `📡 ${F[o].short}の防空基地（${st.J.provs[sam.id].name}${nUsed > 1 ? `ほか${nUsed - 1}基` : ''}）が${F[m.owner].short}の${M_.name}の弾頭${list.length}発のうち${list.length - got.length}発を迎撃した`, o);
   }
   if (!landed.length) return;
   // 兵の損害：持ち主ごとに「各地域が兵力の上限に占める割合×（目標0.9・隣0.6）」の合計
@@ -833,12 +850,14 @@ function stepMissiles(st) {
     }
     if (m.kind === 'strategic') { hitStrategic(st, m); continue; }
     // 迎撃：目標の持ち主の防空基地（半径 SAM_R、装填済み）
-    // 守備範囲内で装填済みの、いちばん近い1基だけが撃つ（重ねても迎撃率は上がらない）
-    let shot = false, sam = null, sd = Infinity;
-    for (const r of st.regions) { if (r.owner !== o || !r.sam || r.samCd > st.t) continue; const d = pdist(st, r.id, m.to); if (d <= SAM_R && d < sd) { sd = d; sam = r; } }
+    // v2.18：近い基地から順に撃ち、外れたら次の基地が撃つ（迎撃できるか、装填済みの基地がなくなるまで）。撃った基地はそれぞれ再装填に入る
+    let shot = false, sam = null, tries = 0;
+    if (o >= 0) for (const b of samsInRange(st, o, [m.to])) {
+      b.samCd = st.t + SAM_CD; tries++;
+      if (rnd() < samRate(st, o, M_)) { sam = b; break; }
+    }
     if (sam) {
-      sam.samCd = st.t + SAM_CD;
-      if (rnd() < M_.intercept + (0.95 - M_.intercept) * (F[o].samBoost || 0)) { shot = true; addLog(st, `📡 ${F[o].short}の防空基地（${st.J.provs[sam.id].name}）が${F[m.owner].short}の${M_.name}を迎撃した`, o); news(st, `🛡 迎撃成功！${F[m.owner].short}の${M_.name}（→${st.J.provs[m.to].name}）を${st.J.provs[sam.id].name}の防空基地が撃ち落とした`, [o], 'good'); news(st, `✖ ${M_.name}（→${st.J.provs[m.to].name}）は${F[o].short}の防空基地に迎撃された`, [m.owner], 'bad'); }
+      { shot = true; addLog(st, `📡 ${F[o].short}の防空基地（${st.J.provs[sam.id].name}）が${F[m.owner].short}の${M_.name}を迎撃した${tries > 1 ? `（${tries}基目で命中）` : ''}`, o); news(st, `🛡 迎撃成功！${F[m.owner].short}の${M_.name}（→${st.J.provs[m.to].name}）を${st.J.provs[sam.id].name}の防空基地が撃ち落とした`, [o], 'good'); news(st, `✖ ${M_.name}（→${st.J.provs[m.to].name}）は${F[o].short}の防空基地に迎撃された`, [m.owner], 'bad'); }
     }
     if (shot) continue;
     if (M_.fukai) {   // 腐海ミサイル：被害はなく、少しでも荒廃していればそこに腐海（核）を生む
@@ -2829,12 +2848,12 @@ const HELP = () => `<h2>遊び方</h2>
 <p><b>☄ 戦略核</b>（💰1330000・射程約1500km）</p><ul>
 <li>目標と、陸続きの隣の地域すべてに弾頭が1発ずつ落ちる（自分や別の勢力の領土にも）</li>
 <li>目標は人口・経済−80%、隣は−50%。落ちた所はすべて焼け野原</li>
-<li>迎撃：落ちる地域の持ち主ごとに防空基地1基が受け持ち、弾頭ごとに50%</li>
+<li>迎撃：落ちる地域の持ち主ごとに、近い防空基地から順に残った弾頭を撃つ（1基あたり弾頭ごとに50%）</li>
 </ul>
 <p><b>📡 防空基地</b>（💰96000から倍々）</p><ul>
 <li>半径約250km以内に来たミサイルを迎撃（巡航80%・弾道40%）</li>
-<li>撃つのは装填済みでいちばん近い1基だけ。撃ったあと20秒は再装填</li>
-<li>2発同時に来ると、1基では片方しか止められない</li>
+<li>近い基地から順に撃ち、外れたら範囲内の次の基地が撃つ（迎撃できるか、装填済みの基地がなくなるまで）</li>
+<li>撃った基地はそれぞれ20秒の再装填。重ねて建てるほど落としやすく、続けざまのミサイルにも強い</li>
 </ul>
 <p><b>被害と焼け野原</b></p><ul>
 <li>重ねて撃たれると被害は掛け算（−100%まで）</li>
