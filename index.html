@@ -493,7 +493,7 @@ function applyPerks(st, f, perks) {
   fa.troops = maxTroops(st, f) * (0.5 + 0.5 * AS(L('start')));
 }
 // マップの倍率（広いほど・敵が多いほど高い）と、勢力の倍率（弱い所から勝つほど高い）
-const WORLD_MAPMUL = { world: 8, eurasia: 5, asia: 4.5, africa: 3.2, europe: 3.1, namerica: 2.1, samerica: 2.2, oceania: 1, antarctica: 1 };
+const WORLD_MAPMUL = { world: 25, eurasia: 12, asia: 8.5, africa: 7, europe: 4, namerica: 3, samerica: 3.2, oceania: 1, antarctica: 1 };
 function mapMul(st) {
   const o = st.opts || {};
   if (st.J.world) return WORLD_MAPMUL[o.map || 'world'] || 1;
