@@ -1052,7 +1052,22 @@ function aiDiplomacy(st, f) {
   }
   // プレイヤーからの返事待ちに、CPUは関与しない（期限で消える）
 }
+// 腐海戦（v2.19）：腐海の地域を選ぶと、その腐海（所属＝飛び地を含む）への戦争。通常の攻撃と同じ st.attacks に def＝FUKAI・fkG＝所属で入れる（st.factions には入れない）
+function canAttackFk(st, f, rid) { const r = st.regions[rid]; return !!r && r.owner === FUKAI && !!st.fukai && originFor(st, f, rid) !== null; }
+function attackFk(st, f, rid, ratio) {
+  if (!canAttackFk(st, f, rid)) return null;
+  const fa = st.factions[f], troops = Math.floor(fa.troops * clamp(ratio, 0.01, 1));
+  if (troops < 10) return null;
+  const g = st.regions[rid].fkG ?? null;
+  fa.troops -= troops;
+  const ex = st.attacks.find(a => a.att === f && a.def === FUKAI && a.fkG === g);   // 同じ腐海への攻撃はまとめる
+  if (ex) { ex.troops += troops; ex.sent += troops; if (!ex.fronts.some(x => x.rid === rid)) ex.fronts.unshift({ rid, prog: 0, from: originFor(st, f, rid) }); return ex; }
+  const a = { id: st.nextAtk++, att: f, def: FUKAI, fkG: g, troops, fronts: [{ rid, prog: 0, from: originFor(st, f, rid) }], sent: troops, taken: 0 };
+  st.attacks.push(a);
+  return a;
+}
 function attack(st, f, rid, ratio) {
+  if (st.regions[rid] && st.regions[rid].owner === FUKAI) return attackFk(st, f, rid, ratio);
   if (!canAttack(st, f, rid)) return null;
   const fa = st.factions[f], troops = Math.floor(fa.troops * clamp(ratio, 0.01, 1));
   if (troops < 10) return null;
@@ -1067,6 +1082,7 @@ function attack(st, f, rid, ratio) {
 }
 // 勢力に対して攻撃（rid があればそこから、なければ攻めやすい所から）
 function attackFaction(st, f, def, ratio, rid) {
+  if (def === FUKAI) return rid != null ? attackFk(st, f, rid, ratio) : null;
   if (rid == null || !canAttack(st, f, rid)) {
     rid = null; let bv = Infinity; const M = map(st.J);
     for (const r of st.regions) if (r.owner === def && canAttack(st, f, r.id)) { const v = holdOf(st, r.id, false, false, originFor(st, f, r.id)); if (v < bv) { bv = v; rid = r.id; } }
@@ -1080,35 +1096,55 @@ function resign(st) {
   return true;
 }
 // 焼け野原を取る：隣の自領から兵を出して数秒で自分の土地にする
-function claimCost(st, rid) { const r = st.regions[rid]; return r.owner === FUKAI ? Math.round(fkTroops(r.fkS || 0, st, r.fkF) / Math.pow(Math.max(1, r.fkN || 1), C.defExp)) : Math.round(C.minGarrison * 3 * sizeOf(st, rid)); }   // 腐海は、つながったかたまりの戦力が大きいほど高い
+function claimCost(st, rid) { const r = st.regions[rid]; if (r.owner === FUKAI) { const g = fkGrp(st, r); return Math.round(fkTroops(g.S || 0, st, g.F) / Math.pow(Math.max(1, g.N || 1), C.defExp)); } return Math.round(C.minGarrison * 3 * sizeOf(st, rid)); }   // 腐海は、その腐海（所属全体、飛び地を含む）の戦力が大きいほど高い（v2.19）
+// 焼け野原の優先権（v2.20）：攻めていた地域が焼け野原になったら、その地域の前線がいちばん進んでいた攻撃が、その兵で焼け野原を取りにいく
+//   （コストは通常の「取る」と同じ。かかる時間は前線の進み具合のぶん短い、最短で1割）。攻撃の兵が足りなければ、30秒間その国だけが「取る」を出せる
+const PRIO_T = 30;
+function burntPrio(st, rid) {
+  const r = st.regions[rid]; let best = null;
+  for (const a of st.attacks) { const x = a.fronts.find(y => y.rid === rid); if (x && st.factions[a.att] && st.factions[a.att].alive && (!best || (x.prog || 0) > (best.x.prog || 0))) best = { a, x }; }
+  if (!best) return;
+  const { a, x } = best, c = claimCost(st, rid), nm = st.J.provs[rid].name;
+  for (const b of st.attacks) b.fronts = b.fronts.filter(y => y.rid !== rid);
+  if (!r.claim && a.troops >= c && originFor(st, a.att, rid) !== null) {
+    a.troops -= c; const T = 3 * sizeOf(st, rid);
+    r.claim = { f: a.att, left: T * (1 - clamp(x.prog || 0, 0, 0.9)), total: T, paid: 0 }; r.prio = null;
+    news(st, `🚩 攻めていた${nm}が焼け野原に。攻撃中の兵💂${kF(c)}で取りにいく`, [a.att], 'good');
+  } else {
+    r.prio = { f: a.att, until: st.t + PRIO_T };
+    news(st, `🚩 攻めていた${nm}が焼け野原に。${PRIO_T}秒間の優先権（兵が足りないので、「取る」で取りにいける）`, [a.att], 'good');
+  }
+}
 function canClaim(st, f, rid) {
-  const r = st.regions[rid]; if (!r || (r.owner !== -1 && r.owner !== FUKAI)) return { ok: false, why: '焼け野原ではない' };
+  const r = st.regions[rid]; if (!r || r.owner !== -1) return { ok: false, why: '焼け野原ではない' };   // v2.19：腐海は腐海戦で攻め取る
   if (r.claim) return { ok: false, why: '取りにいっている勢力がいる' };
+  if (r.prio && r.prio.f !== f && st.t < r.prio.until && st.factions[r.prio.f] && st.factions[r.prio.f].alive) return { ok: false, why: `${st.factions[r.prio.f].short}が優先権を持っている（あと${Math.ceil(r.prio.until - st.t)}秒）` };
   if (originFor(st, f, rid) === null) return { ok: false, why: '自領と接していない' };
   if (st.factions[f].troops < claimCost(st, rid)) return { ok: false, why: '兵が足りない' };
   return { ok: true, cost: claimCost(st, rid) };
 }
 function claim(st, f, rid) {
   const c = canClaim(st, f, rid); if (!c.ok) return false;
-  st.factions[f].troops -= c.cost; const T = 3 * sizeOf(st, rid) * (st.regions[rid].owner === FUKAI ? 2 : 1); st.regions[rid].claim = { f, left: T, total: T, paid: st.regions[rid].owner === FUKAI ? c.cost : 0 };   // total：画面の進み具合の表示用、paid：腐海の奪還の報酬の元（払った兵）
+  st.regions[rid].prio = null; st.factions[f].troops -= c.cost; const T = 3 * sizeOf(st, rid) * (st.regions[rid].owner === FUKAI ? 2 : 1); st.regions[rid].claim = { f, left: T, total: T, paid: st.regions[rid].owner === FUKAI ? c.cost : 0 };   // total：画面の進み具合の表示用、paid：腐海の奪還の報酬の元（払った兵）
   return true;
 }
 function stepClaims(st, dt) {
   for (const r of st.regions) if (r.claim) {
-    if ((r.owner !== -1 && r.owner !== FUKAI) || !st.factions[r.claim.f].alive) { r.claim = null; continue; }
-    r.claim.left -= dt; if (r.claim.left <= 0) {
-      const f = r.claim.f, paid = r.claim.paid || 0; r.claim = null;
-      if (r.owner === FUKAI) {
-        r.rotCd = st.t + FK.immune; st.fukaiN = Math.max(0, (st.fukaiN || 0) - 1);
-        // 奪還の報酬（v2.11）：払った兵×FK.loot の金（上限は戦略核1発ぶん）。CPUは収入と同じ難易度の倍率を掛ける
-        const fa = st.factions[f], gold = Math.round(Math.min(MISSILE.strategic.cost, paid * FK.loot) * (fa.ai ? (DIFF[st.diff] || DIFF.normal).inc : 1));
-        { const D = fkd(st), was = fa.wrath || 0; fa.wrath = Math.min(1, was + D.wGain * (0.5 + Math.min(1, paid / Math.max(1, maxTroops(st, f)) * 5)));   // 腐海の怒り（v2.12）：取り返すほどたまる
-          wrathNote(st, f); }
-        if (gold > 0) { fa.gold += gold; addLog(st, `🍄 ${fa.short}が腐海から${st.J.provs[r.id].name}を取り返し、💰${kF(gold)}を得た`, f); news(st, `💰 腐海から${st.J.provs[r.id].name}を取り返した：報酬💰${kF(gold)}`, [f], 'good'); }
-      }
-      r.rot = 0; capture(st, r.id, f);
-    }
+    if (r.owner === FUKAI) { const fa = st.factions[r.claim.f]; if (fa && fa.alive) fa.troops += r.claim.paid || 0; r.claim = null; continue; }   // v2.19：腐海の奪還は腐海戦に変わった（古いセーブの奪還は兵を返して取り消す）
+    if (r.owner !== -1 || !st.factions[r.claim.f].alive) { r.claim = null; continue; }
+    r.claim.left -= dt; if (r.claim.left <= 0) { const f = r.claim.f; r.claim = null; r.rot = 0; capture(st, r.id, f); }
   }
+}
+// 腐海の地域を攻め取った（v2.19：腐海戦で地域の攻略が終わったとき。中身は旧 stepClaims の腐海の奪還と同じ）
+function fkTaken(st, rid, f, paid) {
+  const r = st.regions[rid], nm = fkNameOf(st, rid);
+  r.rotCd = st.t + FK.immune; st.fukaiN = Math.max(0, (st.fukaiN || 0) - 1);
+  // 奪還の報酬（v2.11）：払った兵×FK.loot の金（上限は戦略核1発ぶん）。CPUは収入と同じ難易度の倍率を掛ける
+  const fa = st.factions[f], gold = Math.round(Math.min(MISSILE.strategic.cost, paid * FK.loot) * (fa.ai ? (DIFF[st.diff] || DIFF.normal).inc : 1));
+  { const D = fkd(st), was = fa.wrath || 0; fa.wrath = Math.min(1, was + D.wGain * (0.5 + Math.min(1, paid / Math.max(1, maxTroops(st, f)) * 5)));   // 腐海の怒り（v2.12）：取り返すほどたまる
+    wrathNote(st, f); }
+  if (gold > 0) { fa.gold += gold; addLog(st, `🍄 ${fa.short}が${nm}から${st.J.provs[rid].name}を取り返し、💰${kF(gold)}を得た`, f); news(st, `💰 ${nm}から${st.J.provs[rid].name}を取り返した：報酬💰${kF(gold)}`, [f], 'good'); }
+  r.rot = 0; capture(st, rid, f);
 }
 /* ---- 腐海（世界地図）：荒れ果てた土地から生まれ、まわりを飲み込む勢力外の存在（詳しくは「腐海システム仕様書.md」） ---- */
 // 持ち主の番号は FUKAI（-4）。勢力ではなく、順位にも勝利条件の分母にも入らない。
@@ -1130,7 +1166,7 @@ function stepClaims(st, dt) {
 //   出す兵＝max(兵力×mf, 守り×1.5)、ただし兵力×capF まで。勝てない所には構えない。守りが上回れば退けられる（必ず成功する進軍はない）。
 //   腐海に囲まれた土地は、水準未満の小さな腐海でも、勝てるならすべて沈めにいく。兵力が巨大な水準以上なら割合は2倍で、ほかの腐海と合体する道すじの1歩目も狙う。
 //   CPUは、腐海の隣の敵地を巡航・弾道・戦略核で焼いて腐海に飲ませる（自領が隣にある所は狙わない）。
-const FUKAI = -4, FK = { scar: 0.2, tick: 2, spawn: 0.25, minFd: 0.4, purify: 1 / 1800, er: 1 / 40, pow: 0.5, cap: 20, claim: 15000, immune: 90, hot: 0.9, near: 0.5, hold: 600, fastDev: 0.81, fastT: 10, regen: 1 / 600, warn: 30, marchFd: 0.2, bigMul: 2, loot: 1.2, misWrath: 0.2, misWrathCap: 0.7, kCool: 180, kFd: 0.7 };   // loot：腐海の奪還の報酬（払った兵1につき金1.2、上限は戦略核1発ぶん）   // scar・spawn・minFd・purify は旧仕様の名残（もう使わない）
+const FUKAI = -4, FK = { scar: 0.2, tick: 2, spawn: 0.25, minFd: 0.4, purify: 1 / 1800, er: 1 / 40, pow: 0.5, cap: 20, claim: 15000, immune: 90, hot: 0.9, near: 0.5, hold: 600, fastDev: 0.81, fastT: 10, regen: 1 / 600, warn: 30, marchFd: 0.2, bigMul: 2, loot: 1.2, misWrath: 0.2, misWrathCap: 0.7, kCool: 180, kFd: 0.7, atkSpd: 4.8 };   // loot：腐海の奪還の報酬（払った兵1につき金1.2、上限は戦略核1発ぶん）   // scar・spawn・minFd・purify は旧仕様の名残（もう使わない）
 // 難易度ごと：発生までのカウントダウン（秒）、侵食の速さの倍率など（purify は v2.10 で浄化をやめたので使っていない）
 const FKD = {   // pw：戦力の倍率、cm：兵力の倍率、mf：1回の進軍に出す最低の割合、mS：進軍を始める戦力、bigT：巨大な腐海の兵力、slots：同時に構える進軍の数（地域20ごとに+1、最大2倍）、minF：新しく構えるのに要る充足率、capF：1回に出せる兵の上限（兵力に対する割合）、regen：充足率の回復（毎秒）
   easy:     { delay: 600, purify: 5400, er: 0.6, pw: 1,   cm: 2, mf: 0.05, mS: 24, bigT: 1.5e8, slots: 1, minF: 0.9,  capF: 0.2,  regen: 1 / 900, wGain: 0.06, wDecay: 1 / 600,  kPool: 0.5,  kStep: 12, kHaz: 0.12 },
@@ -1140,6 +1176,32 @@ const FKD = {   // pw：戦力の倍率、cm：兵力の倍率、mf：1回の進
 const fkd = st => FKD[st.diff] || FKD.normal;
 const fkBand = d => d > 1e-9 ? Math.ceil(d / 0.2 - 1e-9) : 0;   // 荒廃度を20%刻みの段階（1〜5）に。0なら0
 const fkTroops = (S, st, F) => Math.round(FK.claim * fkd(st).cm * Math.pow(1 + S, 1.5) * (F == null ? 1 : F));   // F：兵力の充足率（進軍で減って、時間で戻る）   // 戦力を、取り返すのに要る兵（表示用の兵力）に換算
+// 腐海の所属（v2.19）：つながったかたまりとは別に、腐海ごとに所属（r.fkG）と名前を持つ。
+//   分断されても所属は変わらない（飛び地も同じ腐海）。陸続きで別の腐海と接したときだけ合流し、大きい方（地域数）の名前が残る。
+//   兵力（取り返すコスト・大海嘯の切り出し・表示）は所属全体（st.fkGs[g] の S・N・F）、侵食と進軍の強さはつながったかたまり（fkS）のまま。
+//   名前：発生地の地名＋規模。地域数5未満「〇〇腐海」、5以上「〇〇大腐海」、兵力が巨大（FKD.bigT 以上）なら「〇〇終末腐海」。同じ地名の2つ目は「新」、3つ目から「第三」…
+const FK_MID = 5;
+function fkPlace(s) {
+  s = String(s || '').replace(/[\s　]*[0-9０-９]+$/, '');
+  const a = s.split('・')[0]; if (a.length >= 2) s = a;
+  const t = s.replace(/(自治区|自治州|自治県|自治旗|特別市|特別区|市|町|村|区|郡|県|府|州|省)$/, ''); return t.length >= 1 ? t : s;
+}
+function fkNewG(st, rid) {
+  st.fkGs = st.fkGs || {}; st.fkNameN = st.fkNameN || {}; st.fkNextG = st.fkNextG || 1;
+  const g = st.fkNextG++, pl = fkPlace(st.J.provs[rid].name), n = (st.fkNameN[pl] || 0) + 1, KN = ['', '', '', '三', '四', '五', '六', '七', '八', '九', '十'];
+  st.fkNameN[pl] = n;
+  st.fkGs[g] = { pl: (n === 1 ? '' : n === 2 ? '新' : '第' + (KN[n] || n)) + pl, t0: st.t, S: (st.regions[rid].fd || 0) * fkd(st).pw, N: 1, F: st.regions[rid].fp ?? 1 };
+  return g;
+}
+function fkName(st, g) {
+  const e = st.fkGs && st.fkGs[g]; if (!e) return '腐海';
+  return e.pl + (fkTroops(e.S || 0, st, 1) >= fkd(st).bigT ? '終末腐海' : (e.N || 0) >= FK_MID ? '大腐海' : '腐海');
+}
+const fkNameOf = (st, rid) => fkName(st, st.regions[rid].fkG);
+function fkGrp(st, r) {   // その地域の腐海の兵力の元（所属全体）。所属がない・荒廃度0の地域は、その地域のかたまりの値
+  const e = r.fd > 0 && r.fkG != null && st.fkGs ? st.fkGs[r.fkG] : null;
+  return e && e.S != null ? e : { S: r.fkS || 0, N: r.fkN || 1, F: r.fkF };
+}
 const bare = r => !r.city && !r.factory && !r.port && !r.post && !r.silo && !r.sam && !r.build;
 const landAdj = (st, M, a) => M.adj[a].filter(b => laneType(st, a, b) !== 2);
 const devOf = r => r.fd != null ? r.fd : 1 - (r.scar ?? 1);
@@ -1148,10 +1210,13 @@ function swallow(st, id, force) {
   const r = st.regions[id]; if (r.owner === -2 || r.owner === FUKAI || (devOf(r) <= 1e-9 && !force)) return false;   // 荒廃度0の土地は、ふつうの侵食では飲まれない（進軍だけが飲める）
   const old = r.owner, had = !bare(r), s0 = snapR(st, id);
   const nbF = map(st.J).adj[id].filter(b => laneType(st, id, b) !== 2 && st.regions[b].owner === FUKAI && st.regions[b].fd > 0).map(b => st.regions[b].fkF ?? st.regions[b].fp ?? 1);
-  r.fd = devOf(r) > 1e-9 ? devOf(r) : FK.marchFd; r.fp = nbF.length ? Math.max(...nbF) : 1;   // 生まれたての腐海は充足率100%から。飲み込んだ土地は、隣のかたまりの充足率を引き継ぐ   // 荒廃度は上げない（飲まれたときの値のまま。0の土地を進軍で飲んだときだけ20%から）
+  const nbG = map(st.J).adj[id].filter(b => laneType(st, id, b) !== 2 && st.regions[b].owner === FUKAI && st.regions[b].fd > 0 && st.regions[b].fkG != null && st.fkGs && st.fkGs[st.regions[b].fkG]).map(b => st.regions[b].fkG);
+  r.fd = devOf(r) > 1e-9 ? devOf(r) : FK.marchFd; r.fp = nbF.length ? Math.max(...nbF) : 1;
+  const born = !nbG.length; r.fkG = born ? fkNewG(st, id) : nbG.reduce((a, b) => ((st.fkGs[b].N || 0) > (st.fkGs[a].N || 0) ? b : a));   // 2つ以上の腐海に挟まれた土地は、次の処理で合流する   // 生まれたての腐海は充足率100%から。飲み込んだ土地は、隣のかたまりの充足率を引き継ぐ   // 荒廃度は上げない（飲まれたときの値のまま。0の土地を進軍で飲んだときだけ20%から）
   r.city = 0; r.factory = 0; r.port = 0; r.post = 0; r.silo = 0; r.sam = 0; r.build = null; r.claim = null; r.rot = 0; r.scar = 0; r.hold = 0; r.arm = null; r.fb = fkBand(r.fd);
   capture(st, id, FUKAI);
-  if (!st.fukaiN) addLog(st, `🍄 ${st.J.provs[id].name}に腐海が生まれた。小さいうちなら兵を出して取り返せる（人口と経済は戻らない）`, -1);
+  if (!st.fukaiN) addLog(st, `🍄 ${st.J.provs[id].name}に${fkNameOf(st, id)}が生まれた。小さいうちなら兵を出して取り返せる（人口と経済は戻らない）`, -1);
+  else if (born) addLog(st, `🍄 ${st.J.provs[id].name}に${fkNameOf(st, id)}が生まれた`, old >= 0 ? old : -1);
   else if (old >= 0 && old === st.player) addLog(st, `🍄 ${st.J.provs[id].name}が腐海に飲まれた${had ? '（建物は消えた）' : ''}`, old);
   st.fukaiN = (st.fukaiN || 0) + 1;
   // 通知：自領が飲まれた／自領の近くに腐海が出た・迫ってきた
@@ -1160,7 +1225,7 @@ function swallow(st, id, force) {
     if (old === st.player) news(st, `🍄 ${P[id].name}が腐海に飲まれた！（人口−${pplF(s0.pop)}・建物 ${bltext(s0.b)}）`, [old], 'bad');
     else {
       const near1 = a1.some(b => R[b].owner === st.player), near2 = near1 || a1.some(b => Mp.adj[b].some(c => R[c].owner === st.player)), spawn = !a1.some(b => R[b].owner === FUKAI);
-      if (near2 && spawn) news(st, `🍄 腐海が${P[id].name}に発生！ 自領の${near1 ? 'すぐ隣' : '近く'}。育つ前に取り返すか、荒廃地に建物を`, [st.player], 'bad');
+      if (near2 && spawn) news(st, `🍄 ${fkNameOf(st, id)}が${P[id].name}に発生！ 自領の${near1 ? 'すぐ隣' : '近く'}。育つ前に取り返すか、荒廃地に建物を`, [st.player], 'bad');
       else if (near2 && st.t >= (st.fkAlT || 0)) { st.fkAlT = st.t + 15; news(st, `🍄 腐海が${P[id].name}まで広がった（自領の${near1 ? 'すぐ隣' : '近く'}）`, [st.player], 'warn'); }
     }
   }
@@ -1191,7 +1256,38 @@ function stepFukai(st, dt) {
     clusters.push({ comp, S, F, rep: r.id });
     if (S > maxS) maxS = S;
   }
-  st.fukaiMax = maxS; st.fukaiC = clusters.length;   // fukaiC：腐海のかたまりの数（勢力表の表示用）
+  // 腐海の所属（v2.19）：所属のないかたまり（古いセーブなど）に所属をつけ、1つのかたまりに複数の所属があれば合流させ、所属ごとに兵力の元を集計する
+  st.fkGs = st.fkGs || {};
+  const gCnt = new Map(), gMap = new Map(), gOf = g => { while (gMap.has(g)) g = gMap.get(g); return g; };   // gMap：合流で吸収された所属 → 残る所属
+  for (const r of R) if (r.owner === FUKAI && r.fd > 0 && r.fkG != null && st.fkGs[r.fkG]) gCnt.set(r.fkG, (gCnt.get(r.fkG) || 0) + 1);
+  for (const cl of clusters) {
+    const gs = [...new Set(cl.comp.map(id => R[id].fkG).filter(g => g != null && st.fkGs[g]).map(gOf))];
+    if (!gs.length) { const g = fkNewG(st, cl.comp.reduce((b, id) => ((R[id].fd || 0) > (R[b].fd || 0) ? id : b), cl.comp[0])); gCnt.set(g, 0); gs.push(g); }
+    gs.sort((a, b) => (gCnt.get(b) || 0) - (gCnt.get(a) || 0) || a - b);
+    for (const g of gs.slice(1)) { addLog(st, `🍄 ${fkName(st, gs[0])}が${fkName(st, g)}を呑み込んだ`, -1); gMap.set(g, gs[0]); gCnt.set(gs[0], (gCnt.get(gs[0]) || 0) + (gCnt.get(g) || 0)); }
+    for (const id of cl.comp) if (R[id].fkG == null || !st.fkGs[R[id].fkG]) R[id].fkG = gs[0];
+  }
+  const grp = new Map();
+  for (const r of R) if (r.owner === FUKAI && r.fd > 0 && r.fkG != null) {
+    const g = gOf(r.fkG); r.fkG = g;
+    let e = grp.get(g); if (!e) grp.set(g, e = { g, comp: [], S: 0, Fs: 0 });
+    e.comp.push(r.id); e.S += (r.fd || 0) * D.pw; e.Fs += (r.fp == null ? 1 : r.fp);
+  }
+  let maxG = 0;
+  for (const [g, e] of grp) { e.F = e.Fs / e.comp.length; Object.assign(st.fkGs[g], { S: e.S, N: e.comp.length, F: e.F }); if (e.S > maxG) maxG = e.S; }
+  for (const g of Object.keys(st.fkGs)) if (!grp.has(+g)) delete st.fkGs[g];   // 消えた腐海（名前の通し番号 st.fkNameN は残す）
+  const groups = [...grp.values()];
+  if (gMap.size) {   // 合流した腐海への攻撃：所属を付け替え、同じ国の攻撃は1つにまとめる（v2.19）
+    for (const a of st.attacks) if (a.def === FUKAI && a.fkG != null) a.fkG = gOf(a.fkG);
+    for (const a of st.attacks.slice()) {
+      if (a.def !== FUKAI || !st.attacks.includes(a)) continue;
+      for (const b of st.attacks.filter(x => x !== a && x.def === FUKAI && x.att === a.att && x.fkG === a.fkG)) {
+        a.troops += b.troops; a.sent += b.sent; a.taken += b.taken; for (const x of b.fronts) if (!a.fronts.some(y => y.rid === x.rid)) a.fronts.push(x);
+        st.attacks.splice(st.attacks.indexOf(b), 1);
+      }
+    }
+  }
+  st.fukaiMax = maxG; st.fukaiC = groups.length;   // fukaiC：腐海の数（所属の数。勢力表の表示用）、fukaiMax：いちばん大きい腐海の戦力
   // 進軍：兵力が満タンで、戦力が難易度ごとの水準に達した腐海は、まわりの土地へ進軍する（予告のあと、兵力のmf割で攻める）。荒廃度0の土地も飲める
   const live0 = q => q.owner !== FUKAI && q.owner !== -2;
   // 巨大な腐海（兵力が難易度ごとの水準以上）は、腐海に囲まれた土地と、ほかの腐海と合体できるルートを優先して進軍する
@@ -1213,7 +1309,7 @@ function stepFukai(st, dt) {
   const needOf = (to, from) => { const o = R[to].owner; return o >= 0 ? defPer(st, o) * modOf(st, to, false, true, from) : C.minGarrison; };
   for (const cl of clusters) {
     if (!(cl.S > 0)) continue;
-    const key = cl.rep, inCl = new Set(cl.comp), base = fkTroops(cl.S, st, 1), big = base >= D.bigT, active = cl.S >= D.mS;
+    const key = cl.rep, inCl = new Set(cl.comp), base = fkTroops(cl.S, st, 1), big = base >= D.bigT, active = cl.S >= D.mS, fn = fkNameOf(st, cl.rep);
     let F = cl.F;
     const spend = x => { const d = x / base; F = Math.max(0, F - d); for (const id of cl.comp) { R[id].fp = Math.max(0, (R[id].fp == null ? 1 : R[id].fp) - d); R[id].fkF = F; } };
     const room = () => Math.min(D.capF * base, F * base * 0.9);   // いま1回に出せる兵
@@ -1231,7 +1327,7 @@ function stepFukai(st, dt) {
       if (force < need && e.kind === 1) { keep.push(e); continue; }   // 囲まれた土地は、兵がたまるまで構えたまま待つ
       spend(force);
       const ok = force >= need;
-      if (ok) { if (o >= 0) st.factions[o].troops = Math.max(0, st.factions[o].troops - defLossOf(st, e.to)); if (swallow(st, e.to, true)) { redraw = true; got.push(e.to); } addLog(st, `🍄 腐海の進軍：${st.J.provs[e.to].name}が飲まれた（腐海の兵${kF(force)}）`, o); }
+      if (ok) { if (o >= 0) st.factions[o].troops = Math.max(0, st.factions[o].troops - defLossOf(st, e.to)); if (swallow(st, e.to, true)) { redraw = true; got.push(e.to); } addLog(st, `🍄 ${fn}の進軍：${st.J.provs[e.to].name}が飲まれた（腐海の兵${kF(force)}）`, o); }
       else { if (o >= 0) st.factions[o].troops = Math.max(0, st.factions[o].troops - force * 0.4 / Math.max(1, modOf(st, e.to, false, true, e.from))); addLog(st, `🛡 ${st.J.provs[e.to].name}が腐海の進軍（兵${kF(force)}）を退けた`, o); }
       st.fkMarches = (st.fkMarches || 0) + 1; if (ok) st.fkMarchOk = (st.fkMarchOk || 0) + 1;
     }
@@ -1243,7 +1339,7 @@ function stepFukai(st, dt) {
     const announce = (to, kind) => {
       const e = { c: key, to, from: nbr.get(to), t0: st.t, kind, big }; keep.push(e); taken.add(to); for (const b of landAdj(st, M, to)) near.add(b);
       const nmz = st.J.provs[to].name;
-      addLog(st, kind === 1 ? `⚠ 腐海に囲まれた${nmz}が沈められる（${FK.warn}秒後）` : kind === 2 ? `⚠ 腐海が別の腐海との合体を目指し、${nmz}へ進軍の構え（${FK.warn}秒後）` : `⚠ 腐海が${nmz}へ進軍の構え（${FK.warn}秒後）`, R[to].owner);
+      addLog(st, kind === 1 ? `⚠ ${fn}に囲まれた${nmz}が沈められる（${FK.warn}秒後）` : kind === 2 ? `⚠ ${fn}が別の腐海との合体を目指し、${nmz}へ進軍の構え（${FK.warn}秒後）` : `⚠ ${fn}が${nmz}へ進軍の構え（${FK.warn}秒後）`, R[to].owner);
     };
     if (F >= 0.3) for (const [b] of nbr) if (!taken.has(b) && encl(b) && needOf(b, nbr.get(b)) * 1.5 <= Math.min(D.capF * base, base * 0.9)) announce(b, 1);   // 囲まれた土地はすべて
     if (active && F >= D.minF) {
@@ -1276,8 +1372,15 @@ function stepFukai(st, dt) {
   }
   st.fkWarn = warn;
   // 侵食：隣り合う腐海のかたまりのうち、いちばん強いものの戦力で。荒廃度0の土地は飲まれない
-  const press = new Map();
-  for (const r of R) if (r.owner === FUKAI && r.fd > 0) for (const b of landAdj(st, M, r.id)) { const q = R[b]; if (live(q) && devOf(q) > 1e-9 && (q.rotCd || 0) <= st.t) press.set(b, Math.max(press.get(b) || 0, r.fkS || 0)); }
+  // 侵食の食い止め（v2.19）：その国が、その腐海に「1地域ぶんのコスト」以上の兵で腐海戦をしている間は、その腐海からその国の地域への侵食は止まる（侵食は減っていく）。
+  //   ほかの腐海からの侵食・ほかの国への侵食・進軍・大海嘯は止まらない。pFrom：押している腐海（画面の矢印用）、stop：止めている地域
+  const hold = new Set(); for (const a of st.attacks) if (a.def === FUKAI && a.fkG != null && a.fronts.length && a.troops >= fkGCost(st, a.fkG)) hold.add(a.att + ':' + a.fkG);
+  const press = new Map(), pFrom = new Map(), stop = new Map();
+  for (const r of R) if (r.owner === FUKAI && r.fd > 0) for (const b of landAdj(st, M, r.id)) {
+    const q = R[b]; if (!(live(q) && devOf(q) > 1e-9 && (q.rotCd || 0) <= st.t)) continue;
+    if (q.owner >= 0 && hold.has(q.owner + ':' + r.fkG)) { if (!stop.has(b)) stop.set(b, r.id); continue; }
+    if (!press.has(b) || (r.fkS || 0) > press.get(b)) { press.set(b, r.fkS || 0); pFrom.set(b, r.id); }
+  }
   const rot = [];
   for (const r of R) {
     const S = press.get(r.id);
@@ -1288,8 +1391,9 @@ function stepFukai(st, dt) {
     if (r.rot >= 1) born.push(r.id); else rot.push(r.id);
   }
   st.rotList = rot;
+  st.rotFrom = Object.fromEntries(pFrom); st.rotStop = [...stop].filter(([b]) => !press.has(b));   // 画面の表示用（v2.19）
   for (const id of born) if (swallow(st, id)) redraw = true;
-  if (stepKaisho(st, T, clusters)) redraw = true;
+  if (stepKaisho(st, T, groups)) redraw = true;   // 大海嘯の兵は、狙う国に接する腐海（飛び地を含む所属全体）から切り出す（v2.19）
   if (redraw) st.ver = (st.ver || 0) + 1;
 }
 /* ---- 大海嘯（v2.13） ----
@@ -1352,6 +1456,7 @@ function stepKaisho(st, T, clusters) {
         if (d <= 0) continue;
         pool += base * d;
         for (const id of cl.comp) { R[id].fp = Math.max(0, (R[id].fp ?? 1) - d); R[id].fkF = Math.max(0, cl.F - d); ids.push(id); }
+        if (cl.g != null && st.fkGs && st.fkGs[cl.g]) st.fkGs[cl.g].F = Math.max(0, cl.F - d);
       }
       fa.wrath = 0; wrathNote(st, fa.id); st.kaiCd = st.t + FK.kCool;
       if (pool > 0 && cap != null && R[cap]) {
@@ -1381,12 +1486,14 @@ function stepKaisho(st, T, clusters) {
     k.next = st.t + D.kStep;
   }
   st.kai = st.kai.filter(k => !k.done);
+  for (const k of st.kai) if (k.to != null && R[k.to]) { const o2 = R[k.to].owner; k.od = k.pool / Math.max(1, o2 >= 0 ? defPer(st, o2) * modOf(st, k.to, false, true, k.from) : C.minGarrison); }   // 次の1歩の見込み（画面の表示用、v2.19）
   return redraw;
 }
 function kaiArrive(st, k) {   // 目的地に着いた軍勢：残った兵を、そこの腐海のかたまりの充足率に足す（ふつうの腐海として振る舞う）
-  const R = st.regions, M = map(st.J); if (!(k.pool > 0)) return;
-  const comp = [k.cap], seen = new Set(comp); let S = 0;
-  for (let i = 0; i < comp.length; i++) { S += (R[comp[i]].fd || 0) * fkd(st).pw; for (const b of landAdj(st, M, comp[i])) if (!seen.has(b) && R[b].owner === FUKAI && R[b].fd > 0) { seen.add(b); comp.push(b); } }
+  const R = st.regions; if (!(k.pool > 0)) return;
+  const g = R[k.cap].fkG, e = g != null && st.fkGs ? st.fkGs[g] : null;   // v2.19：所属全体（飛び地を含む）
+  const comp = e ? R.filter(r => r.owner === FUKAI && r.fd > 0 && r.fkG === g).map(r => r.id) : [k.cap];
+  const S = e ? (e.S || 0) : (R[k.cap].fd || 0) * fkd(st).pw;
   const add = k.pool / Math.max(1, fkTroops(S, st, 1));
   for (const id of comp) R[id].fp = Math.min(1, (R[id].fp ?? 0) + add);
 }
@@ -1402,24 +1509,29 @@ function retreat(st, aid) {
   const i = st.attacks.findIndex(a => a.id === aid); if (i < 0) return;
   const a = st.attacks[i]; st.factions[a.att].troops += a.troops * 0.7; st.attacks.splice(i, 1);
 }
+// その攻撃の目標になる地域か（腐海戦は、同じ腐海＝所属の地域。v2.19）
+const isAtkT = (st, a, rid) => { const r = st.regions[rid]; return a.def === FUKAI ? r.owner === FUKAI && (r.fkG ?? null) === a.fkG : r.owner === a.def; };
+// 腐海の1地域あたりのコスト（所属全体の兵力÷地域数^0.6。claimCost と同じ）
+function fkGCost(st, g) { const e = g != null && st.fkGs ? st.fkGs[g] : null; return e ? Math.round(fkTroops(e.S || 0, st, e.F) / Math.pow(Math.max(1, e.N || 1), C.defExp)) : C.minGarrison * 3; }
 function nextTarget(st, a, last, excl) {
-  const M = map(st.J);
+  const M = map(st.J), fk = a.def === FUKAI;
   let best = null, bv = Infinity;
   const consider = (rid, near) => {
-    const r = st.regions[rid]; if (r.owner !== a.def || (excl && excl.has(rid))) return;
+    if (!isAtkT(st, a, rid) || (excl && excl.has(rid))) return;
     const o = originFor(st, a.att, rid); if (o === null) return;
     const sea = laneType(st, o, rid) === 2;
-    const v = holdOf(st, rid, sea, st.regions[o].port, o) * Math.sqrt(Math.max(1, st.J.provs[rid].area / 1500)) * (near ? 1 : 2.5) * (0.85 + rnd() * 0.3);
+    const v = (fk ? claimCost(st, rid) * (sea && !st.regions[o].port ? C.seaDef : 1) : holdOf(st, rid, sea, st.regions[o].port, o)) * Math.sqrt(Math.max(1, st.J.provs[rid].area / 1500)) * (near ? 1 : 2.5) * (0.85 + rnd() * 0.3);
     if (v < bv) { bv = v; best = rid; }
   };
-  if (last !== null) for (const n of M.adj[last]) consider(n, true);
-  if (best === null) for (const r of st.regions) if (r.owner === a.def && M.adj[r.id].some(x => st.regions[x].owner === a.att)) consider(r.id, false);
+  if (last !== null) for (const n of M.adj[last]) consider(n, true);   // 取ったばかりの地域を足場に、その隣から
+  if (best === null) for (const r of st.regions) if (isAtkT(st, a, r.id) && M.adj[r.id].some(x => st.regions[x].owner === a.att)) consider(r.id, false);   // なければ、自領に接するところから（腐海戦は、その腐海の飛び地も含む）
   return best;
 }
 function capture(st, rid, f) {
   const r = st.regions[rid], old = r.owner, F = st.factions;
   if (st.cnt) { if (old >= 0) st.cnt[old]--; st.cnt[f]++; }
   r.owner = f; r.build = null; st.ver = (st.ver || 0) + 1;
+  if (f === -1 && st.attacks) burntPrio(st, rid);   // v2.20：攻めていた地域が焼け野原になったら、攻撃軍が優先して取りにいく
   if (st.rep) st.rep.ev.push(Math.round(st.t * 10) / 10, rid, f);
   if (r.post) r.post--;   // 要塞は取られると1段壊れ、残りは取った側のものになる
   // 首都決戦：敵の県庁を落とすと、その勢力の金の半分を奪う
@@ -1447,6 +1559,21 @@ function eliminate(st, f, by) {
   addLog(st, `【滅亡】${F[f].name}は${by >= 0 ? F[by].short + 'に' : ''}併呑された`, f);
 }
 const inAttack = (st, f) => st.attacks.reduce((t, a) => t + (a.att === f ? a.troops : 0), 0);
+// 見込み（v2.19）：満タンまでの残り時間が短い前線から順にコストを積み上げ、残りの兵で足りるか。
+//   x.od＝残りの兵÷そこまでのコストの合計、x.os＝0 優勢（1.25以上）・1 接戦（1〜1.25）・2 劣勢（1未満）。境目の前後3%は前の状態のまま（ちらつき防止）
+//   a.os＝前線のうちいちばん悪い状態、a.nOk＝今の兵で取れる見込みの地域数
+function frontOdds(a) {
+  const fr = a.fronts.filter(x => x.c > 0 && x.v > 0).sort((p, q) => (1 - p.prog) / p.v - (1 - q.prog) / q.v);
+  const lv = od => od < 1 ? 2 : od < 1.25 ? 1 : 0;
+  let sum = 0, ok = 0;
+  for (const x of fr) {
+    sum += x.c; x.od = a.troops / sum; if (x.od >= 1) ok++;
+    const p = x.os || 0; let s = lv(x.od);
+    if (s > p && lv(x.od * 1.03) <= p) s = p; else if (s < p && lv(x.od / 1.03) >= p) s = p;
+    x.os = s;
+  }
+  a.nOk = ok; a.os = fr.reduce((m, x) => Math.max(m, x.os || 0), 0);
+}
 function stepAttacks(st, dt) {
   const J = st.J, F = st.factions;
   // 攻め合い：互いへの攻撃は、まず兵どうしで相殺する（残った方だけが進む）
@@ -1455,14 +1582,14 @@ function stepAttacks(st, dt) {
     if (b && a.troops > 0) { const m = Math.min(a.troops, b.troops); a.troops -= m; b.troops -= m; }
   }
   for (const a of st.attacks.slice()) {
-    const fa = F[a.att], end = (back = 1) => { if (fa.alive) fa.troops += Math.max(0, a.troops) * back; st.attacks.splice(st.attacks.indexOf(a), 1); };
+    const fa = F[a.att], fk = a.def === FUKAI, end = (back = 1) => { if (fa.alive) fa.troops += Math.max(0, a.troops) * back; st.attacks.splice(st.attacks.indexOf(a), 1); };
     if (a.troops < 1) { st.attacks.splice(st.attacks.indexOf(a), 1); continue; }
-    if (!fa.alive || !F[a.def] || !F[a.def].alive) { end(); continue; }
-    const def = F[a.def];
-    // 前線の数：兵が多いほど同時に多くの地域へ（最大4）
-    const dens = defPer(st, a.def);
+    if (!fa.alive || (!fk && (!F[a.def] || !F[a.def].alive))) { end(); continue; }
+    const def = fk ? null : F[a.def];   // 腐海戦（v2.19）：相手は勢力ではない（st.factions を見ない）
+    // 前線の数：兵が多いほど同時に多くの地域へ（最大4）。腐海戦は1地域のコストを密度の代わりに使う
+    const dens = fk ? fkGCost(st, a.fkG) : defPer(st, a.def);
     const want = clamp(Math.ceil(a.troops / (dens * 4 + 200)), 1, C.maxFronts * (st.war === a.att ? 2 : 1));   // 総力戦中は前線を2倍まで広げる
-    a.fronts = a.fronts.filter(x => st.regions[x.rid].owner === a.def && originFor(st, a.att, x.rid) !== null);
+    a.fronts = a.fronts.filter(x => isAtkT(st, a, x.rid) && originFor(st, a.att, x.rid) !== null);   // 取られた・つながらなくなった目標は外す（腐海戦で他国が先に取った地域も）
     while (a.fronts.length < want) { const nx = nextTarget(st, a, a.lastCap ?? null, new Set(a.fronts.map(x => x.rid))); if (nx === null) break; a.fronts.push({ rid: nx, prog: 0 }); }
     if (!a.fronts.length) { end(); continue; }
     const share = a.troops / a.fronts.length;
@@ -1470,10 +1597,17 @@ function stepAttacks(st, dt) {
     for (const x of a.fronts.slice()) {
       const from = originFor(st, a.att, x.rid); if (from === null) continue; x.from = from;
       const sea = laneType(st, from, x.rid) === 2, port = st.regions[from].port > 0;
-      const cost = atkCost(st, x.rid, a.troops, sea, port, from) * (fa.atkMul || 1) * (def.defMul || 1);
+      const cost = fk ? claimCost(st, x.rid) * (fa.atkMul || 1) : atkCost(st, x.rid, a.troops, sea, port, from) * (fa.atkMul || 1) * (def.defMul || 1);
       const size = sizeOf(st, x.rid);
-      x.prog += dt * C.atkSpeed * Math.pow(clamp(share / cost, 0.3, 6), 0.6) / size * (sea && !port ? C.seaSlow : 1);
+      const v = C.atkSpeed * Math.pow(clamp(share / cost, 0.3, 6), 0.6) / size * (sea && !port ? C.seaSlow : 1) * (fk ? FK.atkSpd : 1);   // 腐海戦は FK.atkSpd 倍（兵が同等なら旧来の奪還と同じ 6秒×広さ）
+      x.c = cost; x.v = v;
+      x.prog += dt * v;
       if (x.prog < 1) continue;
+      if (fk) {   // 腐海戦：腐海の兵は減らない（旧来の奪還と同じ）。足りなければ取れずに尽きる
+        if (a.troops >= cost) { a.troops -= cost; fkTaken(st, x.rid, a.att, cost); a.taken++; a.lastCap = x.rid; a.fronts.splice(a.fronts.indexOf(x), 1); }
+        else { a.troops = 0; break; }
+        continue;
+      }
       const dl = defLossOf(st, x.rid);
       if (a.troops >= cost) {
         a.troops -= cost; def.troops = Math.max(0, def.troops - dl);
@@ -1485,7 +1619,8 @@ function stepAttacks(st, dt) {
       }
     }
     if (dead) { end(); continue; }
-    if (a.troops < 1) st.attacks.splice(st.attacks.indexOf(a), 1);
+    if (a.troops < 1) { st.attacks.splice(st.attacks.indexOf(a), 1); continue; }
+    frontOdds(a);
   }
 }
 // 地域の集合を、つながったかたまりに分ける（大きい順）
@@ -1540,6 +1675,7 @@ function aiThink(st, f) {
   aiMissiles(st, f, mine, B);   // ミサイル基地・防空基地・発射は建設より先に考える（後回しにすると金が建物に消える）
   aiBuild(st, f, mine, B);
   aiClaim(st, f, mine, B);
+  aiFukai(st, f, mine, B);
   if (!wantAtk) aiAttack(st, f, mine, mx, D, B);
 }
 function aiBuild(st, f, mine, B) {
@@ -1571,15 +1707,35 @@ function aiClaim(st, f, mine, B) {
   const fa = st.factions[f], M = map(st.J);
   for (const r of mine) for (const a of M.adj[r.id]) {
     const w = st.regions[a];
-    if ((w.owner === -1 || (w.owner === FUKAI && !((fa.wrath || 0) > 0.6 && wrathTop(st) === f))) && !w.claim && claimCost(st, a) < fa.troops * 0.3) { if (claim(st, f, a)) { B.n--; return; } }   // 怒り（大海嘯のゲージ）が6割を超えたら腐海は取り返さない
+    if (w.owner === -1 && !w.claim && claimCost(st, a) < fa.troops * 0.3) { if (claim(st, f, a)) { B.n--; return; } }   // 怒り（大海嘯のゲージ）が6割を超えたら腐海は取り返さない
   }
+}
+// 腐海戦（v2.19）：隣の腐海へ、1地域ぶんが兵の3割以下なら攻め込む（旧 aiClaim の基準と同じ）。自領が侵食されている腐海を優先。
+//   怒り（大海嘯のゲージ）が6割を超えていちばん恨まれている国は手を出さない。攻める腐海は2つまで、攻めている腐海には接戦・劣勢なら兵を足す
+function aiFukai(st, f, mine, B) {
+  if (B.n <= 0 || !st.fukai) return;
+  const fa = st.factions[f], M = map(st.J);
+  if ((fa.wrath || 0) > 0.6 && wrathTop(st) === f) return;
+  const mineFk = st.attacks.filter(a => a.att === f && a.def === FUKAI);
+  let best = null, bv = Infinity;
+  for (const r of mine) for (const b of M.adj[r.id]) {
+    if (st.regions[b].owner !== FUKAI || originFor(st, f, b) === null) continue;
+    const ex = mineFk.find(a => a.fkG === (st.regions[b].fkG ?? null));
+    if (ex ? !(ex.os >= 1) : mineFk.length >= 2) continue;   // 攻めている腐海は、接戦・劣勢のときだけ兵を足す。新しく攻める腐海は2つまで
+    const v = claimCost(st, b) * ((r.rot || 0) > 0.2 ? 0.5 : 1);
+    if (v < bv) { bv = v; best = b; }
+  }
+  if (best === null) return;
+  const c = claimCost(st, best); if (c > fa.troops * 0.3) return;
+  const send = Math.min(fa.troops * 0.5, Math.max(c * 2.5, fa.troops * 0.2));
+  if (attack(st, f, best, send / Math.max(1, fa.troops))) B.n--;
 }
 function aiAttack(st, f, mine, mx, D, B) {
   if (B.n <= 0) return;
   const fa = st.factions[f], M = map(st.J);
   const sg = standing(st), war = sg.war === f, late = sg.late;
   const thr = { '攻め': 0.45, '慎重': 0.6, '守り': 0.7 }[fa.persona] / D.aggr * (war ? 0.6 : 1);
-  const myAtk = st.attacks.filter(a => a.att === f);
+  const myAtk = st.attacks.filter(a => a.att === f && a.def !== FUKAI);   // 腐海戦は数に入れない（v2.19）
   if (fa.troops < mx * thr || myAtk.length >= (war ? 4 : late ? 3 : 2)) return;
   if (fa.focus != null && (!st.factions[fa.focus] || !st.factions[fa.focus].alive || st.t - (fa.focusT || 0) > 240)) fa.focus = null;   // 集中する相手：倒すか、4分たったら選び直す
   const V = lagView(st, D.delay);                     // 少し前の状況で判断する
@@ -1788,7 +1944,7 @@ function checkOver(st) {
   }
 }
 
-G.Front = { wrathStage, wrathTop, barren, winCount, samPlan, standing, WAR_AT, FUKAI, FK, FKD, fkd, fkTroops, fkBand, swallow, devOf, liveN, CONT_JA, WORLD, WORLD_MAPMUL, wrapDx, get SAM_R() { return SAM_R; }, segDist, victoryProgress, autoInvest, buildGain, terrainOf, riverOf, TERRAIN, MOUNTAINS, RIVERS, geoX, geoY, SCENARIOS, scenarioKey, clusterOf, cityPopMul, cityTroopsOf, regionGold, CLUSTER, CITY_TIERS, nukePoints, effPop, canExtend, extendGame, PERKS, perkCost, AS, mapMul, factionMul, FACTION_MUL, canClaim, claim, claimCost, missileCost, MISSILE, SAM_R, SILO_CD, leaderOf, canLaunch, launch, siloFor, pdist, resign, predict, attackFaction, atkCost, sizeOf, DIFF_PTS, score, PACT, pactOf, canPropose, proposePact, answerRequest, breakPact, neighborsOf, inAttack, C, BUILD, DIFF, REGIONS, PREF_REGION, map, laneType, factionDefs, newGame, step, attack, retreat, build, canBuild, buildCost, canAttack, originFor, holdOf, defPer, maxTroops, goldRate, growRate, regionsOf, fcapOf, ccapOf, countB };
+G.Front = { fkName, fkNameOf, fkGrp, canAttackFk, wrathStage, wrathTop, barren, winCount, samPlan, standing, WAR_AT, FUKAI, FK, FKD, fkd, fkTroops, fkBand, swallow, devOf, liveN, CONT_JA, WORLD, WORLD_MAPMUL, wrapDx, get SAM_R() { return SAM_R; }, segDist, victoryProgress, autoInvest, buildGain, terrainOf, riverOf, TERRAIN, MOUNTAINS, RIVERS, geoX, geoY, SCENARIOS, scenarioKey, clusterOf, cityPopMul, cityTroopsOf, regionGold, CLUSTER, CITY_TIERS, nukePoints, effPop, canExtend, extendGame, PERKS, perkCost, AS, mapMul, factionMul, FACTION_MUL, canClaim, claim, claimCost, missileCost, MISSILE, SAM_R, SILO_CD, leaderOf, canLaunch, launch, siloFor, pdist, resign, predict, attackFaction, atkCost, sizeOf, DIFF_PTS, score, PACT, pactOf, canPropose, proposePact, answerRequest, breakPact, neighborsOf, inAttack, C, BUILD, DIFF, REGIONS, PREF_REGION, map, laneType, factionDefs, newGame, step, attack, retreat, build, canBuild, buildCost, canAttack, originFor, holdOf, defPer, maxTroops, goldRate, growRate, regionsOf, fcapOf, ccapOf, countB };
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
 <script>// 列島フロント：画面
@@ -2242,7 +2398,7 @@ function drawOver(d) {
   // 勢力名と兵力
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   for (const L of labels()) {
-    const f = L.fk ? { short: '🍄腐海' } : st.factions[L.o], p = W2S(L.x, L.y);
+    const f = L.fk ? { short: '🍄' + Fr.fkNameOf(st, L.rid) } : st.factions[L.o], p = W2S(L.x, L.y);
     const fs = Math.max(9, Math.min(26, (6 + Math.sqrt(L.n) * 2.2) * Math.min(1.6, Math.max(0.55, view.sc * 1.2))));
     if (fs < 9.5 && L.n < 3) continue;
     if (L.fk) {   // 腐海：つながったかたまりごとに、名前と戦力・地域数
@@ -2250,7 +2406,7 @@ function drawOver(d) {
       if (!(S > 0)) continue;   // 猶予中（戦力0）の腐海には名札を出さない
       ctx.font = `600 ${fs}px sans-serif`; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(8,12,20,0.9)';
       ctx.strokeText(f.short, p.x, p.y - fs * 0.45); ctx.fillStyle = '#e6b8ff'; ctx.fillText(f.short, p.x, p.y - fs * 0.45);
-      ctx.font = `${Math.round(fs * 0.72)}px sans-serif`; const t = kfmt(Fr.fkTroops(S, st, st.regions[L.rid].fkF));   // 兵力は充足率込み（進軍で減って、時間で戻る）
+      ctx.font = `${Math.round(fs * 0.72)}px sans-serif`; const gp = Fr.fkGrp(st, st.regions[L.rid]), t = kfmt(Fr.fkTroops(gp.S || 0, st, gp.F));   // 兵力は充足率込み（進軍で減って、時間で戻る）。飛び地も同じ腐海の兵力（v2.19）
       ctx.strokeText(t, p.x, p.y + fs * 0.45); ctx.fillStyle = '#d9a8ff'; ctx.fillText(t, p.x, p.y + fs * 0.45); continue;
     }
     if (J.world && fs * f.short.length * 0.95 > Math.sqrt(L.A) / J.kmPerPx * view.sc * 2.2) continue;   // 世界地図：国の大きさに名前が収まらない間は出さない
@@ -2266,16 +2422,9 @@ function drawOver(d) {
     ctx.save(); ctx.setLineDash([3 * lw, 3 * lw]); ctx.beginPath(); ctx.arc(q.x, q.y, RR, 0, 7); ctx.lineWidth = 1.5 * lw; ctx.strokeStyle = 'rgba(255,138,216,0.55)'; ctx.stroke(); ctx.restore();
     ctx.beginPath(); ctx.arc(q.x, q.y, RR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, w.p)); ctx.lineWidth = 3 * lw; ctx.strokeStyle = '#ff8ad8'; ctx.stroke();
   }
-  // 腐海の侵食：自分の地域（観戦中は全部）に、紫の輪で進み具合を出す
-  if (!replay && st.rotList) for (const id of st.rotList) {
-    const r = st.regions[id]; if (!(r.rot > 0.05) || (!st.spectator && r.owner !== st.player)) continue;
-    const q = W2S(J.provs[id].x, J.provs[id].y);
-    const K = uk(), RR = 9 * K, lw = Math.max(0.6, Math.min(1, K));
-    ctx.beginPath(); ctx.arc(q.x, q.y, RR, 0, 7); ctx.lineWidth = 5 * lw; ctx.strokeStyle = 'rgba(8,12,20,0.75)'; ctx.stroke();
-    ctx.beginPath(); ctx.arc(q.x, q.y, RR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, r.rot)); ctx.lineWidth = 3 * lw; ctx.strokeStyle = '#c77dff'; ctx.stroke();
-  }
   // 攻撃・奪還の矢印と進み具合：都市の印・建物・勢力名に埋もれないよう、最後に、印を囲む輪（暗いふち付き）で描く。大きさは引き・寄りに合わせて変わる
-  const front = (from, rid, prog, col, mineAtk, needFrom) => {
+  // os（v2.19）：0 優勢（今まで通り）・1 接戦（右上に黄色の「!」）・2 劣勢（輪が破線・赤い「×」・矢印の流れも遅く）・3 止まっている（「⏸」と薄く）
+  const front = (from, rid, prog, col, mineAtk, needFrom, os = 0) => {
     if (needFrom && from == null) return;
     const K = uk(), lw = Math.max(0.6, Math.min(1, K)), AR = (mineAtk ? 12 : 8) * K;
     ctx.globalAlpha = mineAtk ? 1 : 0.55;
@@ -2283,18 +2432,33 @@ function drawOver(d) {
     if (from != null) {
       const p = W2S(J.provs[from].x, J.provs[from].y), dx = q.x - p.x, dy = q.y - p.y, L = Math.hypot(dx, dy) || 1, ex = q.x - dx / L * AR, ey = q.y - dy / L * AR;   // 矢印は輪の手前で止める
       ctx.strokeStyle = 'rgba(8,12,20,0.7)'; ctx.lineWidth = 4.5 * lw; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(ex, ey); ctx.stroke();
-      ctx.strokeStyle = col; ctx.lineWidth = 2.2 * lw; ctx.setLineDash([5 * lw, 4 * lw]); ctx.lineDashOffset = -tnow * 20;
+      ctx.strokeStyle = col; ctx.lineWidth = 2.2 * lw; ctx.setLineDash(os === 2 ? [2 * lw, 7 * lw] : [5 * lw, 4 * lw]); ctx.lineDashOffset = -tnow * (os === 2 ? 7 : os === 3 ? 0 : 20);
       ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(ex, ey); ctx.stroke(); ctx.setLineDash([]);
     }
     ctx.beginPath(); ctx.arc(q.x, q.y, AR, 0, 7); ctx.lineWidth = (mineAtk ? 6.5 : 5) * lw; ctx.strokeStyle = 'rgba(8,12,20,0.8)'; ctx.stroke();
-    ctx.beginPath(); ctx.arc(q.x, q.y, AR, 0, 7); ctx.lineWidth = 1.2 * lw; ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.stroke();
+    if (os === 2) { ctx.setLineDash([4 * lw, 4 * lw]); ctx.lineWidth = 1.6 * lw; ctx.strokeStyle = 'rgba(240,149,149,0.95)'; } else { ctx.lineWidth = 1.2 * lw; ctx.strokeStyle = os === 3 ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.45)'; }
+    ctx.beginPath(); ctx.arc(q.x, q.y, AR, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+    const ga = ctx.globalAlpha; if (os === 3) ctx.globalAlpha = ga * 0.5;
+    if (os === 2) ctx.setLineDash([7 * lw, 5 * lw]);
     ctx.beginPath(); ctx.arc(q.x, q.y, AR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, prog)); ctx.lineWidth = (mineAtk ? 4 : 3) * lw; ctx.strokeStyle = col; ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = ga;
+    if (os === 1 || os === 2) {   // 右上の印
+      const bx = q.x + AR * 0.75, by = q.y - AR * 0.75, br = Math.max(4.5, 6.5 * K);
+      ctx.beginPath(); ctx.arc(bx, by, br, 0, 7); ctx.fillStyle = os === 1 ? '#EF9F27' : '#E24B4A'; ctx.fill(); ctx.lineWidth = 2 * lw; ctx.strokeStyle = 'rgba(8,12,20,0.9)'; ctx.stroke();
+      if (os === 1) { ctx.fillStyle = '#412402'; ctx.font = `700 ${Math.round(br * 1.6)}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('!', bx, by + br * 0.08); }
+      else { const d = br * 0.45; ctx.strokeStyle = '#FCEBEB'; ctx.lineWidth = 1.8 * lw; ctx.beginPath(); ctx.moveTo(bx - d, by - d); ctx.lineTo(bx + d, by + d); ctx.moveTo(bx + d, by - d); ctx.lineTo(bx - d, by + d); ctx.stroke(); }
+    }
+    if (os === 3) { const h = AR * 0.75, w = Math.max(2, AR * 0.22); ctx.fillStyle = '#CECBF6'; ctx.fillRect(q.x - w * 1.4, q.y - h / 2, w, h); ctx.fillRect(q.x + w * 0.4, q.y - h / 2, w, h); }
   };
   if (!replay) {
-    for (const a of st.attacks) for (const x of a.fronts) front(x.from, x.rid, x.prog, st.factions[a.att].color, st.spectator || a.att === st.player || st.regions[x.rid].owner === st.player, true);
+    // 腐海の侵食（v2.19）：自分の地域（観戦中は全部）に、押してくる腐海から紫の矢印と輪（進み具合＝侵食）。逆侵攻で止めている所は「⏸」
+    const erShow = id => st.spectator || st.regions[id].owner === st.player;
+    for (const id of st.rotList || []) { const r = st.regions[id]; if (r.rot > 0.05 && erShow(id)) front((st.rotFrom || {})[id] ?? null, id, r.rot, '#c77dff', true, false, 0); }
+    for (const [id, from] of st.rotStop || []) if (erShow(id)) front(from, id, st.regions[id].rot || 0, '#c77dff', true, false, 3);
+    for (const a of st.attacks) for (const x of a.fronts) front(x.from, x.rid, x.prog, st.factions[a.att].color, st.spectator || a.att === st.player || st.regions[x.rid].owner === st.player, true, x.os || 0);
     // 奪還（焼け野原・腐海を取り返している最中）も、攻撃と同じように矢印と進み具合の輪を出す
     for (const k of st.kai || []) if (k.from != null && k.to != null) {   // 大海嘯の軍勢：先端の腐海から次の地域へ、矢印と輪（次の1歩までの時間）と兵力
-      const kS = Fr.fkd(st).kStep; front(k.from, k.to, 1 - Math.max(0, k.next - st.t) / kS, '#c77dff', true, true);
+      const kS = Fr.fkd(st).kStep; front(k.from, k.to, 1 - Math.max(0, k.next - st.t) / kS, '#c77dff', true, true, k.od == null ? 0 : k.od < 1 ? 2 : k.od < 1.25 ? 1 : 0);
       const q = W2S(J.provs[k.to].x, J.provs[k.to].y), fs = 13; ctx.font = `700 ${fs}px sans-serif`; ctx.textAlign = 'center'; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(8,12,20,0.9)';
       const t = '🌊' + kfmt(k.pool); ctx.strokeText(t, q.x, q.y - 22 * uk()); ctx.fillStyle = '#e6b8ff'; ctx.fillText(t, q.x, q.y - 22 * uk());
     }
@@ -2345,7 +2509,7 @@ function renderBoard() {
   const top = rows.slice(0, isNarrow() ? 6 : 10);
   const mine = rows.findIndex(r => r.f.id === st.player);
   $('#board').className = boardMin ? 'min' : '';
-  setHTML($('#board'), `<div class="r" id="bdT" style="cursor:pointer"><b>勢力（${rows.length}）</b><span class="dim">${boardMin ? '▾' : '▴'}</span></div><div class="rows">${top.map((r, i) => `<div class="r" ${r.f.id === st.player ? 'style="color:#ffe08a"' : ''}><span><span class="dot" style="${dotStyle(r.f)}"></span>${i + 1}. ${esc(r.f.short)}${r.f.id === Fr.leaderOf(st) ? ' 👑' : ''}${!st.spectator && Fr.pactOf(st, st.player, r.f.id) ? ' 🤝' : ''}</span><span title="兵力の上限（最大国力）・地域数">⚔${kfmt(r.mx)}・${r.n}</span></div>`).join('')}${mine >= top.length ? `<div class="r" style="color:#ffe08a"><span>${mine + 1}. ${esc(me().short)}</span><span>${rows[mine].n}・${kfmt(me().troops)}</span></div>` : ''}${st.fukaiN ? `<div class="r" style="color:#c77dff" title="順位・勝利条件には数えない。兵力はいちばん大きいかたまりのもの（かたまりどうしは兵力を共有しない）"><span>🍄 腐海${st.fukaiC > 1 ? `（${st.fukaiC}群）` : ''}</span><span title="いちばん大きいかたまりの兵力・腐海の地域数の合計">最大⚔${kfmt(Fr.fkTroops(st.fukaiMax || 0, st))}・計${st.fukaiN}</span></div>` : ''}</div>`);
+  setHTML($('#board'), `<div class="r" id="bdT" style="cursor:pointer"><b>勢力（${rows.length}）</b><span class="dim">${boardMin ? '▾' : '▴'}</span></div><div class="rows">${top.map((r, i) => `<div class="r" ${r.f.id === st.player ? 'style="color:#ffe08a"' : ''}><span><span class="dot" style="${dotStyle(r.f)}"></span>${i + 1}. ${esc(r.f.short)}${r.f.id === Fr.leaderOf(st) ? ' 👑' : ''}${!st.spectator && Fr.pactOf(st, st.player, r.f.id) ? ' 🤝' : ''}</span><span title="兵力の上限（最大国力）・地域数">⚔${kfmt(r.mx)}・${r.n}</span></div>`).join('')}${mine >= top.length ? `<div class="r" style="color:#ffe08a"><span>${mine + 1}. ${esc(me().short)}</span><span>${rows[mine].n}・${kfmt(me().troops)}</span></div>` : ''}${st.fukaiN ? `<div class="r" style="color:#c77dff" title="順位・勝利条件には数えない。兵力はいちばん大きい腐海のもの（飛び地も同じ腐海の兵力を共有する。別の腐海どうしは共有しない）"><span>🍄 腐海${st.fukaiC > 1 ? `（${st.fukaiC}つ）` : ''}</span><span title="いちばん大きい腐海の兵力・腐海の地域数の合計">最大⚔${kfmt(Fr.fkTroops(st.fukaiMax || 0, st))}・計${st.fukaiN}</span></div>` : ''}</div>`);
 }
 $('#board').onclick = e => { if (e.target.closest('#bdT')) { boardMin = !boardMin; renderBoard(); } };
 function renderRatio() {
@@ -2360,22 +2524,42 @@ function renderRatio() {
 }
 function renderRatioVal() { const v = $('#rVal'); if (v) v.textContent = `${Math.round(ratio * 100)}%（${kfmt(me().troops * ratio)}）`; }
 let atkKey = '';
+// 攻撃一覧の相手の名前・色（腐海戦は腐海の名前、v2.19）と、見込みの表示
+const atkName = a => a.def === Fr.FUKAI ? (st.fkGs && st.fkGs[a.fkG] ? Fr.fkName(st, a.fkG) : '腐海') : st.factions[a.def].short;
+const atkCol = a => a.def === Fr.FUKAI ? '#c77dff' : st.factions[a.def].color;
+function oddsTag(a, vs) {   // 次の地域も取れない＝劣勢。いくつか取れるが今の前線を全部は取れない＝あとn地域で尽きる
+  const s = a.os || 0; if (!s) return '';
+  if (s === 2 && !a.nOk) return vs ? '<span style="color:#8fdc8f">✕押し返せる見込み</span>' : '<span class="bad">✕劣勢（取れずに尽きる）</span>';
+  if (s === 2) return `<span style="color:#ffc24a">!あと${a.nOk}地域で${vs ? '止まる見込み' : '尽きる'}</span>`;
+  return '<span style="color:#ffc24a">!接戦</span>';
+}
+// 自国への侵食を腐海ごとにまとめる（v2.19）：進んでいるもの（🍄）と、逆侵攻で止めているもの（⏸）
+function erosionList() {
+  if (st.spectator) return [];
+  const m = new Map(), R = st.regions, add = (k, g, stop, rot) => { const e = m.get(k) || { k, g, n: 0, max: 0, stop }; e.n++; e.max = Math.max(e.max, rot); m.set(k, e); };
+  for (const id of st.rotList || []) { const r = R[id]; if (r.owner !== st.player || !(r.rot > 0.05)) continue; const fr = (st.rotFrom || {})[id], g = fr != null ? R[fr].fkG : null; add('e' + g, g, false, r.rot); }
+  for (const [id, fr] of st.rotStop || []) { const r = R[id]; if (r.owner !== st.player) continue; const g = R[fr].fkG; add('s' + g, g, true, r.rot || 0); }
+  return [...m.values()];
+}
+const erText = e => { const nm = esc(e.g != null && st.fkGs && st.fkGs[e.g] ? Fr.fkName(st, e.g) : '腐海'); return e.stop ? `⏸ ${nm}の侵食を止めている（逆侵攻中・${e.n}地域）` : `🍄 ${nm}が侵食中（${e.n}地域・最大${Math.min(99, Math.round(e.max * 100))}%）`; };
 function renderAtks() {
   if (st.spectator) { $('#atks').innerHTML = ''; atkKey = ''; return; }
-  const mine = st.attacks.filter(a => a.att === st.player), vs = st.attacks.filter(a => a.def === st.player);
+  const mine = st.attacks.filter(a => a.att === st.player), vs = st.attacks.filter(a => a.def === st.player), ers = erosionList();
   const reqs = (st.requests || []).filter(q => q.to === st.player);
   const mis = (st.missiles || []).filter(m => m.def === st.player || m.owner === st.player);
-  const key = mine.map(a => a.id).join(',') + '|' + vs.map(a => a.id).join(',') + '|' + reqs.map(q => q.from).join(',') + '|' + mis.map(m => m.id).join(',');
+  const key = mine.map(a => a.id).join(',') + '|' + vs.map(a => a.id).join(',') + '|' + reqs.map(q => q.from).join(',') + '|' + mis.map(m => m.id).join(',') + '|' + ers.map(e => e.k).join(',');
   if (key === atkKey) {   // 数字だけ更新（ボタンを押している最中に作り直さない）
-    mine.concat(vs).forEach(a => { const b = document.querySelector(`[data-at="${a.id}"]`); if (b) b.textContent = kfmt(a.troops); const t = document.querySelector(`[data-tk="${a.id}"]`); if (t) t.textContent = a.taken + '取'; });
+    mine.concat(vs).forEach(a => { const b = document.querySelector(`[data-at="${a.id}"]`); if (b) b.textContent = kfmt(a.troops); const t = document.querySelector(`[data-tk="${a.id}"]`); if (t) t.textContent = a.taken + '取'; const od = document.querySelector(`[data-od="${a.id}"]`); if (od) { const h = oddsTag(a, a.att !== st.player); if (od._h !== h) { od._h = h; od.innerHTML = h; } } });
     reqs.forEach(q => { const t = document.querySelector(`[data-rq="${q.from}"]`); if (t) t.textContent = Math.ceil(q.until - st.t) + '秒'; });
     mis.forEach(m => { const t = document.querySelector(`[data-ms="${m.id}"]`); if (t) t.textContent = Math.max(0, Math.ceil(m.eta - st.t)) + '秒'; });
+    ers.forEach(e => { const t = document.querySelector(`[data-er="${e.k}"]`); if (t) { const h = erText(e); if (t._h !== h) { t._h = h; t.innerHTML = h; } } });
     return;
   }
   atkKey = key;
   $('#atks').innerHTML = mis.map(m => `<div class="a" style="border-color:${m.def === st.player ? '#7a3a3a' : '#6a5a2a'}"><span class="${m.def === st.player ? 'bad' : ''}">${Fr.MISSILE[m.kind].icon} ${m.def === st.player ? `${esc(st.factions[m.owner].short)}の${Fr.MISSILE[m.kind].name}が${esc(J.provs[m.to].name)}へ接近` : `${Fr.MISSILE[m.kind].name}→${esc(J.provs[m.to].name)}`}</span><b data-ms="${m.id}">${Math.max(0, Math.ceil(m.eta - st.t))}秒</b></div>`).join('') + reqs.map(q => `<div class="a" style="border-color:#3a6a4a"><span>🤝 <b style="color:${st.factions[q.from].color}">${esc(st.factions[q.from].short)}</b>が不可侵条約を申し込んできた</span><span class="dim" data-rq="${q.from}">${Math.ceil(q.until - st.t)}秒</span><button data-ry="${q.from}">受ける</button><button data-rn="${q.from}">断る</button></div>`).join('') +
-    mine.map(a => `<div class="a"><span style="color:${st.factions[a.def].color}">⚔→${esc(st.factions[a.def].short)}</span><b data-at="${a.id}">${kfmt(a.troops)}</b><span class="dim" data-tk="${a.id}">${a.taken}取</span><button data-rt="${a.id}">撤退</button></div>`).join('') +
-    vs.map(a => `<div class="a" style="border-color:#7a3a3a"><span class="bad">🛡 ${esc(st.factions[a.att].short)}が侵攻中</span><b data-at="${a.id}">${kfmt(a.troops)}</b></div>`).join('');
+    mine.map(a => `<div class="a"><span style="color:${atkCol(a)}">⚔→${esc(atkName(a))}</span><b data-at="${a.id}">${kfmt(a.troops)}</b><span class="dim" data-tk="${a.id}">${a.taken}取</span><span data-od="${a.id}">${oddsTag(a, false)}</span><button data-rt="${a.id}">撤退</button></div>`).join('') +
+    vs.map(a => `<div class="a" style="border-color:#7a3a3a"><span class="bad">🛡 ${esc(st.factions[a.att].short)}が侵攻中</span><b data-at="${a.id}">${kfmt(a.troops)}</b><span data-od="${a.id}">${oddsTag(a, true)}</span></div>`).join('') +
+    ers.map(e => `<div class="a" style="border-color:${e.stop ? '#4a4a7a' : '#5b2a78'}"><span data-er="${e.k}" style="color:${e.stop ? '#cecbf6' : '#c77dff'}">${erText(e)}</span></div>`).join('');
   document.querySelectorAll('[data-rt]').forEach(b => b.onclick = () => { Fr.retreat(st, +b.dataset.rt); toast('撤退させた（7割が戻る）'); atkKey = ''; renderAtks(); });
   document.querySelectorAll('[data-ry]').forEach(b => b.onclick = () => { Fr.answerRequest(st, +b.dataset.ry, true); toast(`🤝 ${st.factions[+b.dataset.ry].short}と不可侵条約を結んだ（${Math.round(Fr.PACT.dur / 60)}分）`); atkKey = ''; renderAtks(); renderSel(true); renderBoard(); });
   document.querySelectorAll('[data-rn]').forEach(b => b.onclick = () => { Fr.answerRequest(st, +b.dataset.rn, false); atkKey = ''; renderAtks(); });
@@ -2415,11 +2599,21 @@ function bonusLine(rid) {
   if (!parts.length && !pmTxt) return '';
   return `<div class="small">${[parts.length ? parts.join('・') : '', pmTxt].filter(Boolean).join('　')}</div>`;
 }
+// 腐海を選んだとき：腐海戦の侵攻・撤退（v2.19）
+const fkEx = (r, f) => st.attacks.find(a => a.att === f.id && a.def === Fr.FUKAI && a.fkG === (r.fkG ?? null));
+function fkAtkLabel(r, f) {
+  const send = f.troops * ratio, ex = fkEx(r, f), c = Fr.claimCost(st, sel), n = Math.min(Fr.fkGrp(st, r).N || 1, Math.floor((send + (ex ? ex.troops : 0)) / Math.max(1, c)));
+  return `⚔ ${esc(Fr.fkNameOf(st, sel))}へ侵攻（${kfmt(send)}）<br><small>${Fr.canAttackFk(st, f.id, sel) ? `1地域 約${kfmt(c)}・見込み約${n}地域${ex ? '（今の攻撃と合わせて）' : ''}` : '自領と接していない'}</small>`;
+}
+function fkBtns(r, f) {
+  const ex = fkEx(r, f), can = Fr.canAttackFk(st, f.id, sel) && f.troops * ratio >= 10;
+  return `<button class="primary" id="bAtkFk" ${can ? '' : 'disabled'}>${fkAtkLabel(r, f)}</button>${ex ? `<button id="bRetFk">↩ 撤退（${kfmt(ex.troops * 0.7)}が戻る）</button>` : ''}`;
+}
 function renderSel(force) {
   if (sel === null) { if ($('#sel').innerHTML) $('#sel').innerHTML = ''; selKey = ''; return; }
   const r = st.regions[sel], p = J.provs[sel], o = r.owner;
   const f = st.spectator ? null : me();
-  const key = [sel, o, st.regions[sel] && st.regions[sel].claim ? st.regions[sel].claim.f : '', !!(f && o >= 0 && st.attacks.some(a => a.att === f.id && a.def === o)), r.city, r.factory, r.port, r.post, r.build ? r.build.kind : '', r.scar, r.fb, o === Fr.FUKAI ? Math.floor(st.t / 30) : '', f ? !!Fr.canAttack(st, f.id, sel) : '', f ? (Fr.siloFor(st, f.id, sel, 'cruise') != null) + '' + (Fr.siloFor(st, f.id, sel, 'ballistic') != null) : '', f && o >= 0 ? (c => c.ok + (c.why || '').replace(/[0-9]+/g, ''))(Fr.canPropose(st, f.id, o)) : '', f && o >= 0 && Fr.pactOf(st, f.id, o) ? Fr.pactOf(st, f.id, o).end : '', clusterKey(sel), terrainKey(sel)].join('|');
+  const key = [sel, o, st.regions[sel] && st.regions[sel].claim ? st.regions[sel].claim.f : '', r.prio && st.t < r.prio.until ? Math.ceil((r.prio.until - st.t) / 5) : '', !!(f && st.attacks.some(a => a.att === f.id && a.def === o && (o !== Fr.FUKAI || a.fkG === (r.fkG ?? null)))), r.city, r.factory, r.port, r.post, r.build ? r.build.kind : '', r.scar, r.fb, o === Fr.FUKAI ? Math.floor(st.t / 30) : '', f ? !!Fr.canAttack(st, f.id, sel) : '', f ? (Fr.siloFor(st, f.id, sel, 'cruise') != null) + '' + (Fr.siloFor(st, f.id, sel, 'ballistic') != null) : '', f && o >= 0 ? (c => c.ok + (c.why || '').replace(/[0-9]+/g, ''))(Fr.canPropose(st, f.id, o)) : '', f && o >= 0 && Fr.pactOf(st, f.id, o) ? Fr.pactOf(st, f.id, o).end : '', clusterKey(sel), terrainKey(sel)].join('|');
   if (!force && key === selKey) { updSel(); return; } selKey = key;
   const pref = J.prefs[p.pref - 1];
   let h = `<div class="card"><div class="row"><h3>${esc(p.name)} <span class="small dim">${esc(pref.short)}</span></h3><button id="selX" style="min-height:28px;padding:0 8px">✕</button></div>
@@ -2429,9 +2623,9 @@ function renderSel(force) {
       <div class="small dim">都市の上限${Fr.ccapOf(p)}段階（現実の人口密度・経済力から）・工場はどこでも${Fr.fcapOf(p)}段階・港は3段階まで。港・工場・都市は、重ねたり隣に並べたりすると集積ボーナス（同じ種類：重ねて1段階+15%・陸続きの隣1段階+10%、違う種類：同じ地域か隣の1段階ごとに+5%、上限+100%）。まとめるほど強いが、ミサイル（特に戦略核）でまとめて焼かれる</div>`;
   } else if (f && (o === -1 || o === Fr.FUKAI)) {
     const c = Fr.canClaim(st, f.id, sel);
-    h += (o === Fr.FUKAI ? `<div class="small" style="margin-top:4px">🍄 <b>腐海</b>　兵力 <b>${kfmt(Fr.fkTroops(r.fkS || 0, st, r.fkF))}</b>（この地域を取るには <b>${kfmt(Fr.claimCost(st, sel))}</b>）・この地域の荒廃度${Math.round((r.fd ?? 1) * 100)}%${f ? `・<span class="${(f.wrath || 0) >= 0.3 ? 'bad' : 'dim'}">腐海の怒り（自国）：${Fr.wrathStage(f.wrath || 0)}${Fr.wrathTop(st) === f.id && (f.wrath || 0) > 0 ? '・最も恨まれている' : ''}</span>` : ''}${st.kai && st.kai.length ? `<br>🌊 大海嘯：${st.kai.map(k => esc(st.factions[k.f].short) + 'の首都・' + esc(J.provs[k.cap].name) + 'へ（兵' + kfmt(k.pool) + '）').join('、')}` : ''}<br>兵力が大きいほど、まわりを速く飲み込み、取り返すのに多くの兵が要る（荒廃度が高い土地ほど速く飲まれ、荒廃度0の土地は飲まれない。荒廃度81%以上の土地は約10秒で飲まれる）。飲まれた地域は建物が消え、人口と経済が0になる（取り返しても戻らない）。腐海は時間では弱らない（荒廃度は飲まれた時点のまま）。取り返した土地は不毛な土地として、勝利条件の地域数に数えない。取り返すと、払った兵×1.2の金（上限は戦略核1発ぶん）が手に入る。ただし取り返すほど腐海の怒りがたまり、大海嘯（腐海の軍勢が、いちばん恨まれている国の首都へ押し寄せる）を招く。育った腐海は守りに見合う兵を出して多方面へ進軍し、腐海に囲まれた土地は残さず沈めにくる（勝てない相手には構えない）。ミサイルで焼くと焼け野原に戻るが、荒廃度が上がる。まわりに腐海が残っていればすぐ飲まれ直す（小さいうちなら焼けば消える）。</div><div class="small dim">` : '') + (o === -1 && r.fd === 0 ? `<div class="small" style="margin-top:4px">🌱 <b>不毛な土地</b>：腐海に飲まれたことのある空き地（荒廃度0%）。人口と経済は0のまま、勝利条件の地域数にも数えない。ミサイルで荒れると、また腐海になりうる。</div>` : '') + `<div class="small" style="margin-top:4px">🔥 <b>焼け野原</b>：ミサイルで誰のものでもなくなった土地（荒廃度${Math.round(Fr.devOf(r) * 100)}%・取り直しても人口と経済は戻らない分）。隣に自領があれば、兵を出して取り直せる。</div>
-      ${r.claim ? `<div class="small">🚩 ${esc(st.factions[r.claim.f].short)}が取りにいっている（あと${Math.ceil(r.claim.left)}秒）</div>` : ''}
-      <div class="btns"><button class="primary" id="bClaim" ${c.ok ? '' : 'disabled'}>🚩 兵${kfmt(Fr.claimCost(st, sel))}で取る${c.ok ? '' : `<br><small>${esc(c.why)}</small>`}</button>${st.fukai && st.regions.some(x => x.owner === f.id && x.silo) ? Object.entries(Fr.MISSILE).filter(([k, M_]) => o === -1 ? M_.fukai : !M_.fukai).map(([k, M_]) => { const cl = Fr.canLaunch(st, f.id, sel, k); return `<button data-ms0="${k}" ${cl.ok ? '' : 'disabled'} title="${esc(M_.text)}">${M_.icon} ${o === -1 ? M_.name : M_.name + 'で焼く'}<br><small>${cl.ok || cl.why === '金が足りない' ? '💰' + kfmt(Fr.missileCost(st, f.id, k)) : esc(cl.why)}</small></button>`; }).join('') : ''}</div>` + (o === Fr.FUKAI ? '</div>' : '');
+    h += (o === Fr.FUKAI ? `<div class="small" style="margin-top:4px">🍄 <b>${esc(Fr.fkNameOf(st, sel))}</b>　兵力 <b>${kfmt(Fr.fkTroops(Fr.fkGrp(st, r).S || 0, st, Fr.fkGrp(st, r).F))}</b>・${Fr.fkGrp(st, r).N || 1}地域（この地域を取るには <b>${kfmt(Fr.claimCost(st, sel))}</b>）・この地域の荒廃度${Math.round((r.fd ?? 1) * 100)}%${f ? `・<span class="${(f.wrath || 0) >= 0.3 ? 'bad' : 'dim'}">腐海の怒り（自国）：${Fr.wrathStage(f.wrath || 0)}${Fr.wrathTop(st) === f.id && (f.wrath || 0) > 0 ? '・最も恨まれている' : ''}</span>` : ''}${st.kai && st.kai.length ? `<br>🌊 大海嘯：${st.kai.map(k => esc(st.factions[k.f].short) + 'の首都・' + esc(J.provs[k.cap].name) + 'へ（兵' + kfmt(k.pool) + '）').join('、')}` : ''}<br>兵力が大きいほど、まわりを速く飲み込み、取り返すのに多くの兵が要る（荒廃度が高い土地ほど速く飲まれ、荒廃度0の土地は飲まれない。荒廃度81%以上の土地は約10秒で飲まれる）。飲まれた地域は建物が消え、人口と経済が0になる（取り返しても戻らない）。腐海は時間では弱らない（荒廃度は飲まれた時点のまま）。取り返した土地は不毛な土地として、勝利条件の地域数に数えない。取り返すと、払った兵×1.2の金（上限は戦略核1発ぶん）が手に入る。ただし取り返すほど腐海の怒りがたまり、大海嘯（腐海の軍勢が、いちばん恨まれている国の首都へ押し寄せる）を招く。育った腐海は守りに見合う兵を出して多方面へ進軍し、腐海に囲まれた土地は残さず沈めにくる（勝てない相手には構えない）。ミサイルで焼くと焼け野原に戻るが、荒廃度が上がる。まわりに腐海が残っていればすぐ飲まれ直す（小さいうちなら焼けば消える）。</div><div class="small dim">` : '') + (o === -1 && r.fd === 0 ? `<div class="small" style="margin-top:4px">🌱 <b>不毛な土地</b>：腐海に飲まれたことのある空き地（荒廃度0%）。人口と経済は0のまま、勝利条件の地域数にも数えない。ミサイルで荒れると、また腐海になりうる。</div>` : '') + `<div class="small" style="margin-top:4px">🔥 <b>焼け野原</b>：ミサイルで誰のものでもなくなった土地（荒廃度${Math.round(Fr.devOf(r) * 100)}%・取り直しても人口と経済は戻らない分）。隣に自領があれば、兵を出して取り直せる。</div>
+      ${r.claim ? `<div class="small">🚩 ${esc(st.factions[r.claim.f].short)}が取りにいっている（あと${Math.ceil(r.claim.left)}秒）</div>` : ''}${!r.claim && r.prio && st.t < r.prio.until && st.factions[r.prio.f] ? `<div class="small">🚩 ${r.prio.f === st.player ? 'あなた' : esc(st.factions[r.prio.f].short)}が優先権を持っている（あと${Math.ceil(r.prio.until - st.t)}秒）</div>` : ''}
+      <div class="btns">${o === Fr.FUKAI ? fkBtns(r, f) : `<button class="primary" id="bClaim" ${c.ok ? '' : 'disabled'}>🚩 兵${kfmt(Fr.claimCost(st, sel))}で取る${c.ok ? '' : `<br><small>${esc(c.why)}</small>`}</button>`}${st.fukai && st.regions.some(x => x.owner === f.id && x.silo) ? Object.entries(Fr.MISSILE).filter(([k, M_]) => o === -1 ? M_.fukai : !M_.fukai).map(([k, M_]) => { const cl = Fr.canLaunch(st, f.id, sel, k); return `<button data-ms0="${k}" ${cl.ok ? '' : 'disabled'} title="${esc(M_.text)}">${M_.icon} ${o === -1 ? M_.name : M_.name + 'で焼く'}<br><small>${cl.ok || cl.why === '金が足りない' ? '💰' + kfmt(Fr.missileCost(st, f.id, k)) : esc(cl.why)}</small></button>`; }).join('') : ''}</div>` + (o === Fr.FUKAI ? '</div>' : '');
   } else if (f && o >= 0) {
     const E = st.factions[o], pc = Fr.pactOf(st, f.id, o), ex = st.attacks.find(a => a.att === f.id && a.def === o);
     const can = Fr.regionsOf(st, o).some(x => Fr.canAttack(st, f.id, x.id));
@@ -2454,6 +2648,8 @@ function renderSel(force) {
   $('#selX').onclick = () => { sel = null; renderSel(); };
   document.querySelectorAll('[data-b]').forEach(b => b.onclick = () => { if (Fr.build(st, st.player, sel, b.dataset.b)) toast(`${Fr.BUILD[b.dataset.b].name}を建設中`); renderSel(true); renderTop(); });
   if ($('#bAtk')) $('#bAtk').onclick = () => doAttack(sel);
+  if ($('#bAtkFk')) $('#bAtkFk').onclick = () => doAttack(sel);
+  if ($('#bRetFk')) $('#bRetFk').onclick = () => { const ex = fkEx(st.regions[sel], me()); if (ex) { Fr.retreat(st, ex.id); toast('撤退させた（7割が戻る）'); } atkKey = ''; renderAtks(); renderSel(true); };
   if ($('#bClaim')) $('#bClaim').onclick = () => { toast(Fr.claim(st, st.player, sel) ? '🚩 焼け野原へ兵を出した' : '取れません'); renderSel(true); };
   document.querySelectorAll('[data-ms0]').forEach(b => b.onclick = () => { const m = Fr.launch(st, st.player, sel, b.dataset.ms0); toast(m ? `${Fr.MISSILE[m.kind].icon} ${Fr.MISSILE[m.kind].name}を発射（${Math.ceil(m.eta - st.t)}秒後に着弾）` : '撃てません'); atkKey = ''; renderAtks(); renderSel(true); renderTop(); });
   if ($('#bRet')) $('#bRet').onclick = () => { const ex = st.attacks.find(a => a.att === st.player && a.def === st.regions[sel].owner); if (ex) { Fr.retreat(st, ex.id); toast('撤退させた（7割が戻る）'); } atkKey = ''; renderAtks(); renderSel(true); };
@@ -2462,7 +2658,7 @@ function renderSel(force) {
     toast(!r2.ok ? r2.why : r2.accepted ? `🤝 ${st.factions[o2].short}と不可侵条約を結んだ（${Math.round(Fr.PACT.dur / 60)}分）` : `${st.factions[o2].short}に断られた`);
     renderSel(true); renderAtks(); renderBoard();
   };
-  if ($('#bBreak')) $('#bBreak').onclick = () => { const o2 = st.regions[sel].owner; overlay(`<h2>条約の破棄</h2><p>${esc(st.factions[o2].name)}との不可侵条約の破棄を通告します。${Fr.PACT.notice}秒後に失効し、以後この相手とは条約を結べなくなります。</p>`, [{ label: '通告する', primary: true, fn: () => { Fr.breakPact(st, st.player, o2); renderSel(true); } }, { label: 'やめる' }]); };
+  if ($('#bBreak')) $('#bBreak').onclick = () => { const o2 = st.regions[sel].owner; overlay(`<h2>条約の破棄</h2><p>${esc(st.factions[o2].name)}との不可侵条約の破棄を通告します。${Fr.PACT.notice}秒後に失効し、以後この相手とは条約を結べなくなります。</p>`, [{ label: '通告する', primary: true, fn: () => { Fr.breakPact(st, st.player, o2); renderSel(true); } }, { label: 'やめる' }], true); };
 }
 const predText = (pr, send, ex) => `見込み：${ex ? '今の攻撃と合わせて' : 'この兵で'}約<b>${pr.n}</b>地域（全${pr.total}）${pr.n >= pr.total ? '・滅ぼせる' : `・相手の兵は約${kfmt(pr.enemyLeft)}まで減る`}<span class="dim">（相手の回復は含まない）</span>`;
 const pactText = pc => pc.end ? `破棄の通告済み（あと${Math.max(0, Math.ceil(pc.end - st.t))}秒で失効）` : `残り${mmss(Math.max(0, pc.until - st.t))}`;
@@ -2476,6 +2672,7 @@ function updSel() {
   });
   const o = st.regions[sel].owner;
   document.querySelectorAll('[data-ms0]').forEach(b => { const c = Fr.canLaunch(st, f.id, sel, b.dataset.ms0); b.disabled = !c.ok; const sm = b.querySelector('small'); if (sm) sm.textContent = '💰' + kfmt(Fr.missileCost(st, f.id, b.dataset.ms0)) + (c.ok ? '' : '・' + c.why); });
+  const bf = $('#bAtkFk'); if (bf && o === Fr.FUKAI) { const r2 = st.regions[sel]; bf.innerHTML = fkAtkLabel(r2, f); bf.disabled = !(Fr.canAttackFk(st, f.id, sel) && f.troops * ratio >= 10); }
   const ba = $('#bAtk'); if (ba && o >= 0) ba.textContent = `⚔ ${st.factions[o].short}に攻撃（${kfmt(f.troops * ratio)}）`;
   const pt = $('#predTxt'); if (pt && o >= 0) { const ex = st.attacks.find(a => a.att === f.id && a.def === o); pt.innerHTML = predText(Fr.predict(st, f.id, o, f.troops * ratio + (ex ? ex.troops : 0)), f.troops * ratio, ex); }
   const pl = $('#pactLeft'); if (pl) { const pc = Fr.pactOf(st, f.id, st.regions[sel].owner); if (pc) pl.textContent = pactText(pc); else renderSel(true); }
@@ -2485,7 +2682,7 @@ function doAttack(rid) {
   if (performance.now() - lastAtkT < 600) return;   // 連打で兵が出すぎないように
   const o = st.regions[rid].owner, before = me().troops;
   const a = Fr.attackFaction(st, st.player, o, ratio, rid);
-  if (a) { lastAtkT = performance.now(); toast(`⚔ ${kfmt(before - me().troops)}で${st.factions[o].short}へ攻撃（合計${kfmt(a.troops)}）`); } else toast('攻撃できません（兵が足りないか、接していません）');
+  if (a) { lastAtkT = performance.now(); toast(`⚔ ${kfmt(before - me().troops)}で${o === Fr.FUKAI ? Fr.fkNameOf(st, rid) : st.factions[o].short}へ攻撃（合計${kfmt(a.troops)}）`); } else toast('攻撃できません（兵が足りないか、接していません）');
   renderAtks(); renderSel(true);
 }
 let toastT = 0;
@@ -2533,8 +2730,8 @@ $('#bAuto').onclick = () => showAuto();
 document.querySelectorAll('#menu [data-m]').forEach(b => b.onclick = () => {
   $('#menu').style.display = 'none';
   if (b.dataset.m === 'hist') showHistory(); if (b.dataset.m === 'code') showCode();
-  if (b.dataset.m === 'resign') { if (!st || st.over || st.spectator) { toast('投了できるゲームがありません'); return; } const f = me(); overlay(`<h2>投了</h2><p>ここで投了して、戦歴ポイントを確定します。</p><p class="small">最大版図 ${Math.max(f.peak, Fr.regionsOf(st, f.id).length)}地域・倒した勢力 ${(st.elim || []).filter(e => e.by === st.player).length} → <b>${Fr.score(st)}pt</b>（勝利の150ptは入りません）</p>`, [{ label: '投了する', primary: true, fn: () => { Fr.resign(st); save(); } }, { label: 'やめる' }]); }
-  if (b.dataset.m === 'new') showSetup(); if (b.dataset.m === 'all') fitAll(); if (b.dataset.m === 'help') overlay(HELP(), [{ label: '閉じる', primary: true }]);
+  if (b.dataset.m === 'resign') { if (!st || st.over || st.spectator) { toast('投了できるゲームがありません'); return; } const f = me(); overlay(`<h2>投了</h2><p>ここで投了して、戦歴ポイントを確定します。</p><p class="small">最大版図 ${Math.max(f.peak, Fr.regionsOf(st, f.id).length)}地域・倒した勢力 ${(st.elim || []).filter(e => e.by === st.player).length} → <b>${Fr.score(st)}pt</b>（勝利の150ptは入りません）</p>`, [{ label: '投了する', primary: true, fn: () => { Fr.resign(st); save(); } }, { label: 'やめる' }], true); }
+  if (b.dataset.m === 'new') showSetup(); if (b.dataset.m === 'all') fitAll(); if (b.dataset.m === 'help') overlay(HELP(), [{ label: '閉じる', primary: true }], true);
 });
 
 /* ---- 画面の切り替え ---- */
@@ -2558,7 +2755,7 @@ function showAuto() {
     <h4>続けるか</h4><div class="chips"><button data-ak="0" class="${!autoSet.keep ? 'on' : ''}">今回だけ</button><button data-ak="1" class="${autoSet.keep ? 'on' : ''}">🔁 建設が終わるたびに続ける</button></div>
     <div class="small dim">1つの地域では同時に1件しか建てられないので、一括でも「建設中でない地域の数」までになります。続ける設定なら、建て終わるたびに残りを自動で建てます。</div>
     <div class="small" style="margin-top:6px">金額で指定：<input id="arIn" type="number" min="0" step="1000" value="${autoSet.reserve}" style="width:110px;font:inherit;background:#0f1522;color:inherit;border:1px solid #26324a;border-radius:6px;padding:4px"></div>`,
-    [{ label: '一括で建てる', primary: true, fn: runAuto }, { label: 'やめる' }]);
+    [{ label: '一括で建てる', primary: true, fn: runAuto }, { label: 'やめる' }], true);
   const saveSet = () => {};
   box.querySelectorAll('[data-am]').forEach(b => b.onclick = () => { autoSet.mode = b.dataset.am; saveSet(); showAuto(); });
   box.querySelectorAll('[data-ar]').forEach(b => b.onclick = () => { autoSet.reserve = +b.dataset.ar; saveSet(); showAuto(); });
@@ -2578,11 +2775,11 @@ function autoTick() {   // 続ける設定のとき、約1秒ごとに空いた�
   if (!autoSet.keep || !st || st.spectator || st.over || paused) return;
   if (Fr.autoInvest(st, me().id, autoSet.mode, autoSet.reserve, autoSet.fukai, autoSet.sam === true).length) { selKey = ''; }
 }
-function overlay(html, buttons) {
-  const el = $('#overlay'); paused = true;
+function overlay(html, buttons, keep) {   // keep：閉じたら開く前の一時停止の状態に戻す（ゲーム中に開くダイアログ用、v2.20）
+  const el = $('#overlay'), was = paused; paused = true;
   $('#ovbox').innerHTML = html + `<div class="btns" style="margin-top:12px">${buttons.map((b, i) => `<button data-ov="${i}" class="${b.primary ? 'primary' : ''}">${b.label}</button>`).join('')}</div>`;
   el.style.display = 'flex'; $('#ovbox').scrollTop = 0;
-  buttons.forEach((b, i) => { $(`[data-ov="${i}"]`).onclick = () => { el.style.display = 'none'; if (st && !st.over) paused = false; if (b.fn) b.fn(); renderTop(); }; });
+  buttons.forEach((b, i) => { $(`[data-ov="${i}"]`).onclick = () => { el.style.display = 'none'; if (st && !st.over) paused = keep ? was : false; if (b.fn) b.fn(); renderTop(); }; });
   return $('#ovbox');
 }
 function showSetup() {
@@ -2858,9 +3055,12 @@ const HELP = () => `<h2>遊び方</h2>
 <p><b>被害と焼け野原</b></p><ul>
 <li>重ねて撃たれると被害は掛け算（−100%まで）</li>
 <li>焼け野原は、隣に自領がある勢力が兵を出せば数秒で取り直せる</li>
+<li>攻めていた地域が焼け野原になったら、攻撃中の兵でそのまま取りにいく（前線が進んでいたぶん早く取れる）。兵が足りなければ30秒間の優先権が付き、その間はほかの国は取れない</li>
 </ul></details>
 <details><summary>地図の印</summary><ul>
 <li>☆：県庁（首都）</li>
+<li>攻撃の輪：実線＝優勢、右上に黄色の「!」＝接戦、破線の輪と赤い「×」＝劣勢（このままでは取れずに尽きる）。攻撃一覧にも出る</li>
+<li>紫の矢印と輪：腐海の侵食（輪が侵食の進み具合）。「⏸」は逆侵攻で侵食を止めている所</li>
 <li>◉：人口500万以上 ／ ◎：100万以上 ／ ○：50万以上（ミサイルがよく効く目標。寄って見たときだけ表示）</li>
 <li>人口はミサイルの被害を反映した後の数（カードの人口も同じ）</li>
 <li>被害を受けた地域は赤い点線の印になり、人口が減ると ◉→◎→○→◌ と格下げ</li>
@@ -2968,7 +3168,10 @@ const HELP = () => `<h2>遊び方</h2>
 <li>取り返しても勝利条件の地域数に数えない（分母にも自分の数にも）</li>
 </ul>
 <p><b>対処</b></p><ul>
-<li>生まれたてなら兵を出して取り返せる。大きく育つと手が出せない</li>
+<li>腐海を選んで「⚔ 侵攻」：その腐海（飛び地も含む）との戦争になる。通常の戦争と同じく、兵力に応じて複数の前線を立て、取った地域を足場に次々と攻め取る。撤退すると7割が戻る</li>
+<li>1地域のコスト＝その腐海の兵力÷地域数^0.6（攻め取っても腐海の兵力は減らない）。大きく育つと手が出せない</li>
+<li>同じ腐海には複数の国が同時に攻め込める。同じ地域は先に攻め取った国のもの</li>
+<li>腐海戦で、その腐海に1地域ぶんのコスト以上の兵を向けている間は、その腐海から自国への侵食が止まる（地図に「⏸」。侵食は少しずつ戻る）。進軍・大海嘯・ほかの腐海からの侵食は止まらない</li>
 <li>ミサイルで焼くと焼け野原に戻るが、荒廃度が上がる。まわりに腐海が残っていればすぐ飲まれ直して前より強くなる（小さいうちなら焼けば消える）</li>
 <li>取り返すと報酬の金：払った兵×1.2（1地域で戦略核1発ぶんまで。育った腐海ほど多い）</li>
 </ul>
